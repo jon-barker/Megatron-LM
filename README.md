@@ -114,6 +114,7 @@ Megatron-LM/
 │   ├── inference/               # Inference server
 │   ├── legacy/                  # Legacy components
 │   └── post_training/           # Post-training (RLHF, etc.)
+│   └── rl/           		 # RL environment definition and utils
 ├── examples/                    # Ready-to-use training examples
 ├── tools/                       # Utility tools
 ├── tests/                       # Comprehensive test suite
