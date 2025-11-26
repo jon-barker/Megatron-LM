@@ -39,14 +39,15 @@ class MathAgent(RewardOnlyAgent):
         matched_format = None
         end_of_text_token = "<|end_of_text|>"
 
-        # Only <answer>X</answer> immediately followed by <|end_of_text|> yields 1.0 reward
+        # Only <answer>X</answer> immediately followed by <|end_of_text|> or <|endoftext|> yields 1.0 reward.
         answer_tag_pattern = r'<answer>(.*?)</answer>'
         answer_tag_match = list(re.finditer(answer_tag_pattern, response, re.DOTALL))
         if answer_tag_match:
-            # Only consider the last occurrence, as before.
+            # Only consider the last occurrence
             last_match = answer_tag_match[-1]
             final_answer = last_match.group(1).strip()
             after = response[last_match.end():].lstrip()  # strip whitespace between </answer> and token
+
             try:
                 parsed_answer = parse(final_answer)
             except ValueError as e:
@@ -55,14 +56,14 @@ class MathAgent(RewardOnlyAgent):
                 return NEGATIVE_REWARD
 
             correct_answer = verify(str(golden[golden_key]), parsed_answer)
-
             if correct_answer:
-                if after.startswith(end_of_text_token):
-                    # Correct answer, with correct format and end of text token
-                    return 1.0
-                else:
-                    # Correct answer, but format/end-of-text is not correct
-                    return NEGATIVE_REWARD
+                # Accept either <|end_of_text|> or <|endoftext|> as valid terminators, for flexibility.
+                end_tokens = [end_of_text_token, "<|endoftext|>"]
+                for token in end_tokens:
+                    if after.startswith(token):
+                        return 1.0
+                # If a correct answer but missing immediate end, give format reward (not NEGATIVE_REWARD).
+                return self.format_reward
             else:
                 # Incorrect answer, regardless of format/end-of-text
                 return self.format_reward
