@@ -17,7 +17,8 @@ COMMON_OPTIONS="\
     --${PRECISION:-bf16} \
     --te-rng-tracker \
     --rl-offload-optimizer-during-inference \
-    --inference-dynamic-batching-buffer-size-gb 20 \
+    --inference-dynamic-batching-buffer-size-gb 10 \
+    --disable-chunked-prefill \
     --data-parallel-random-init \
     --attention-backend flash \
     --timing-log-level 1 \
