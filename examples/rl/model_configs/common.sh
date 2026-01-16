@@ -17,7 +17,7 @@ COMMON_OPTIONS="\
     --${PRECISION:-bf16} \
     --te-rng-tracker \
     --rl-offload-optimizer-during-inference \
-    --inference-dynamic-batching-buffer-size-gb 10 \
+    --inference-dynamic-batching-buffer-size-gb 20 \
     --disable-chunked-prefill \
     --data-parallel-random-init \
     --attention-backend flash \
@@ -26,6 +26,7 @@ COMMON_OPTIONS="\
     --save-retain-interval 120 \
     --inference-dynamic-batching-num-cuda-graphs 1 \
     --inference-dynamic-batching-unified-memory-level 1 \
+    --rl-inference-model-unified-memory-level 1 \
     --adam-beta1 0.9 \
     --adam-beta2 ${ADAM_BETA2:-0.95} \
     --adam-eps 1e-8 \
