@@ -1619,6 +1619,10 @@ def megatron_rl_inference_mode(
                 )
                 kv_cache = inference_interface._inference_engine.context.memory_buffer
                 inference_interface._inference_engine.context.memory_buffer = kv_cache.cuda()
+                mamba_conv_states = inference_interface._inference_engine.context.mamba_conv_states
+                inference_interface._inference_engine.context.mamba_conv_states = mamba_conv_states.cuda()
+                mamba_ssm_states = inference_interface._inference_engine.context.mamba_ssm_states
+                inference_interface._inference_engine.context.mamba_ssm_states = mamba_ssm_states.cuda()
             elif remove_kv_cache_during_training:
                 if inference_interface._inference_engine.context.memory_buffer is None:
                     inference_interface._inference_engine.context.build_memory_buffer()
@@ -1649,6 +1653,10 @@ def megatron_rl_inference_mode(
                     f"[{dist.get_rank()}] Offloading kv cache ({kv_cache.numel() * kv_cache.element_size() / 1024**3:.2f} GB) to CPU"
                 )
                 inference_interface._inference_engine.context.memory_buffer = kv_cache.cpu()
+                mamba_conv_states = inference_interface._inference_engine.context.mamba_conv_states
+                inference_interface._inference_engine.context.mamba_conv_states = mamba_conv_states.cpu()
+                mamba_ssm_states = inference_interface._inference_engine.context.mamba_ssm_states
+                inference_interface._inference_engine.context.mamba_ssm_states = mamba_ssm_states.cpu()
             elif remove_kv_cache_during_training:
                 inference_interface._inference_engine.context.memory_buffer = None
 

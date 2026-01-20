@@ -17,6 +17,8 @@ COMMON_OPTIONS="\
     --${PRECISION:-bf16} \
     --te-rng-tracker \
     --rl-offload-optimizer-during-inference \
+    --rl-offload-kv-cache-during-training \
+    --rl-reset-cuda-graphs \
     --inference-dynamic-batching-buffer-size-gb 20 \
     --data-parallel-random-init \
     --attention-backend flash \
