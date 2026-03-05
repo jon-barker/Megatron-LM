@@ -1062,11 +1062,11 @@ def prepare_trajectories(
         tokenizer : HuggingFaceTokenizer
         if not tokenizer.pad:
             for pad_token in DEFAULT_PAD_TOKENS:
-                if pad_token in tokenizer.tokenizer.get_vocab():
+                if pad_token in tokenizer._tokenizer.tokenizer.get_vocab():
                     log_single_rank(
                         logger, logging.INFO, f"Updating tokenizer pad token to {pad_token}"
                     )
-                    tokenizer.pad_token = pad_token
+                    tokenizer._tokenizer.pad_token = pad_token
                     break
             else:
                 raise ValueError("No pad token found in tokenizer vocabulary")
