@@ -104,9 +104,10 @@ dev = [
     "fastapi~=0.50",                                          # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
     "datasets",
     "emerging_optimizers",
-    "flask[async]",
     "hypercorn",
-    "openai",
+    "quart",
+    "openai[aiohttp]",
+    "orjson",
 ]
 
 lts = [
@@ -242,7 +243,8 @@ markers = [
 concurrency = ["thread", "multiprocessing"]
 omit = [
     "/tmp/*",
-    "/workspace/tests/*",
+    "/opt/megatron-lm/tests/*",
+    "/opt/megatron-lm/tools/*",
     "/usr/local/lib/python3.12/dist-packages/*",
 ]
 parallel = true
