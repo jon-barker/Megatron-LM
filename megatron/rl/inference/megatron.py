@@ -132,7 +132,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             max_keepalive_connections=concurrency_limit,
         )
         http_client = DefaultAioHttpClient(
-            timeout=httpx.Timeout(connect=15, read=600, write=600, pool=600),
+            timeout=httpx.Timeout(connect=15, read=60000, write=60000, pool=60000),
             limits=custom_limits,
             http2=use_http2
         )
