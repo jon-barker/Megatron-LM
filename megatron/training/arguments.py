@@ -2332,6 +2332,76 @@ def _add_rl_args(parser):
                        help='If set, use inference logprobs in importance sampling correction of the loss.')
     group.add_argument('--rl-importance-sampling-truncation-coef', type=float, default=None,
                        help="If --inference-logprobs-is-correction is on and this coefficient is set, apply truncation for the IS correction at GRPO loss.")
+    group.add_argument('--rl-logprob-mismatch-num-examples', type=int, default=0,
+                       help='Number of rollout generations to log to W&B with per-token train-vs-inference logprob mismatch plots. '
+                            'Set to 0 to disable.')
+    group.add_argument('--rl-logprob-mismatch-max-tokens', type=int, default=0,
+                       help='Maximum generated tokens to include per selected rollout mismatch plot. '
+                            'Set to 0 to include the full generation.')
+    group.add_argument('--rl-logprob-mismatch-selection', type=str, default='top_abs_delta',
+                       choices=['top_abs_delta', 'top_prob_abs_diff', 'first',
+                                'top_abs_delta_per_group', 'top_prob_abs_diff_per_group'],
+                       help='How to choose rollout generations for per-token logprob mismatch W&B plots.')
+    group.add_argument('--rl-logprob-mismatch-top-k', type=int, default=0,
+                       help='If positive, log train/inference top-k token distributions at the largest mismatch '
+                            'positions for each selected rollout.')
+    group.add_argument('--rl-logprob-mismatch-topk-positions', type=int, default=8,
+                       help='Number of largest mismatch token positions per selected rollout to enrich with top-k overlap data.')
+    group.add_argument('--rl-determinism-probe-dir', type=str, default=None,
+                       help='Directory for opt-in RL determinism probe JSONL activation hashes. '
+                            'Set to None to disable.')
+    group.add_argument('--rl-determinism-probe-phases', type=str, default='inference,training_old_logprobs',
+                       help='Comma-separated probe phases to log. Supported phases are inference, '
+                            'training_old_logprobs, and training_update.')
+    group.add_argument('--rl-determinism-probe-module-filter', type=str,
+                       default=os.environ.get('RL_DETERMINISM_PROBE_MODULE_FILTER'),
+                       help='Optional regex matched against module names before registering probe hooks.')
+    group.add_argument('--rl-determinism-probe-targets-file', type=str,
+                       default=os.environ.get('RL_DETERMINISM_PROBE_TARGETS_FILE'),
+                       help='Optional JSON file of target token keys to probe. When set, activation '
+                            'logging is restricted to matching (iteration, routing_dump_id, target_token_index).')
+    group.add_argument('--rl-determinism-probe-write-targets-file', type=str, default=None,
+                       help='Write a JSON file containing the worst train-vs-inference logprob mismatch '
+                            'token keys for a later targeted probe run.')
+    group.add_argument('--rl-determinism-probe-num-targets', type=int, default=64,
+                       help='Number of worst mismatch token keys to write with '
+                            '--rl-determinism-probe-write-targets-file.')
+    group.add_argument('--rl-determinism-probe-target-selection', type=str,
+                       default='top_logprob_delta',
+                       choices=['top_logprob_delta', 'top1_disagreement_high_margin'],
+                       help='How to select token keys for --rl-determinism-probe-write-targets-file.')
+    group.add_argument('--rl-determinism-probe-target-min-margin', type=float, default=0.5,
+                       help='Minimum train/inference top1-top2 margin for '
+                            'top1_disagreement_high_margin target selection.')
+    group.add_argument('--rl-determinism-probe-max-rollouts', type=int, default=0,
+                       help='Maximum rollout/request index to log per phase. Set 0 for no rollout cap.')
+    group.add_argument('--rl-determinism-probe-max-generated-tokens', type=int, default=0,
+                       help='Maximum generated-token offsets to log on training-side phases. '
+                            'Set 0 for no token cap.')
+    group.add_argument('--rl-determinism-probe-hash-inputs',
+                       action=argparse.BooleanOptionalAction, type=bool, default=True,
+                       help='Hash and log module inputs in addition to outputs for the RL determinism probe.')
+    group.add_argument('--rl-determinism-probe-store-values',
+                       action=argparse.BooleanOptionalAction, type=bool, default=False,
+                       help='Store flattened float32 row values for probe records so the comparator can '
+                            'compute numeric deltas. This can make logs large; use with rollout/token caps.')
+    group.add_argument('--rl-determinism-probe-value-max-elements', type=int, default=0,
+                       help='Maximum flattened elements to store per probe row when '
+                            '--rl-determinism-probe-store-values is enabled. Set 0 for full rows.')
+    group.add_argument('--rl-match-train-logit-moments-to-inference', action=argparse.BooleanOptionalAction, type=bool, default=False,
+                       help='For RL old-logprob recompute, rescale train-side logits per token to match inference-side '
+                            'logit mean/std when those stats are available.')
+    group.add_argument('--rl-prefill-rescore-rollout-dir', type=str, default=None,
+                       help='Diagnostic mode: load rollout_*.npz files from this directory and compare original '
+                            'decode logprobs with full-prefill inference prompt logprobs using the normal RL inference engine.')
+    group.add_argument('--rl-prefill-rescore-rollout-file', type=str, default=None,
+                       help='Diagnostic mode: rescore a single rollout npz file, launching and exiting after one file.')
+    group.add_argument('--rl-prefill-rescore-results-dir', type=str, default=None,
+                       help='Directory for --rl-prefill-rescore-rollout-dir comparison artifacts. Defaults to the rollout dir.')
+    group.add_argument('--rl-prefill-rescore-max-rollouts', type=int, default=0,
+                       help='Maximum rollout npz files to rescore in diagnostic mode. Set 0 for all files.')
+    group.add_argument('--rl-prefill-rescore-timeout-seconds', type=float, default=600.0,
+                       help='Timeout for each fixed-token full-prefill inference scoring request.')
     group.add_argument('--rl-use-sequence-packing', action=argparse.BooleanOptionalAction, type=bool, default=False,
                        help='Enable sequence packing')
     group.add_argument('--rl-sequence-packing-max-sequences-per-bin', type=int, default=50,

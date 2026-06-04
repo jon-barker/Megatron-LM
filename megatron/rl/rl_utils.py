@@ -2,6 +2,7 @@
 
 import gc
 
+import asyncio
 import copy
 from functools import partial
 # Keep this to make the env registered.
@@ -94,6 +95,16 @@ from wandb import wandb_run
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
 )
+from megatron.rl.determinism_probe import (
+    build_training_token_metadata,
+    ensure_determinism_probe,
+    get_determinism_probe,
+    hash_token_ids,
+    probe_enabled,
+    probe_needs_rollout_ids,
+    probe_scope,
+    probe_tensor_point,
+)
 
 from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_SAVER
 if HAVE_TORCH_MEMORY_SAVER:
@@ -108,6 +119,11 @@ _GLOBAL_PACKING_CONTEXT = None
 # Track whether the inference model is currently paused (offloaded to CPU).
 # Model starts on GPU after creation and is used immediately, so starts as False.
 _INFERENCE_MODEL_IS_PAUSED = False
+
+# Side channel for optional diagnostic top-k logprobs.  The Megatron pipeline
+# schedules expect forward output to be tensor-like, so get_logprobs() must not
+# return a tuple when diagnostics are enabled.
+_LOGPROBS_TOPK_BUFFER = []
 
 
 def _torch_saver_swap_inference_model(*, to_cpu: bool) -> None:
@@ -302,6 +318,10 @@ class RLRuntimeState:
         self.last_collection_iteration = 0
         self.sequences_this_iteration_on_rank = 0
         self.latest_batch_num_sequences = 0
+        self.probe_turn_metadata = None
+        self.probe_generation_masks = None
+        self.probe_tokens = None
+        self.probe_iteration = 0
 
     def reset_iteration_counters(self, iteration):
         """Reset per-iteration counters."""
@@ -476,6 +496,822 @@ def align_unpacked_inference_logprobs(
     return padded_inference_logprobs
 
 
+def _first_generated_token_index(generation_mask: torch.Tensor) -> int | None:
+    """Return the full-sequence index of the first generated token."""
+    generated_positions = torch.nonzero(generation_mask.bool(), as_tuple=False).flatten()
+    if generated_positions.numel() == 0:
+        return None
+    return int(generated_positions[0].item())
+
+
+def _rollout_reward_scalar(reward: list[float] | float | None) -> float | None:
+    if reward is None:
+        return None
+    if isinstance(reward, list):
+        return float(np.mean(reward)) if reward else None
+    return float(reward)
+
+
+def _build_logprob_mismatch_turn_metadata(
+    rollouts: Rollouts,
+    rollout_metadata: list[dict[str, Any]] | None = None,
+    inference_top_logprobs_by_turn: list | None = None,
+) -> list[dict[str, Any]]:
+    """Build per-turn metadata aligned with prepare_trajectories() row order."""
+    args = get_args()
+    include_top_logprobs = getattr(args, "rl_logprob_mismatch_top_k", 0) > 0
+    turn_metadata = []
+    rollout_metadata = rollout_metadata or [{} for _ in rollouts]
+    for local_rollout_idx, rollout in enumerate(rollouts):
+        metadata = rollout_metadata[local_rollout_idx] if local_rollout_idx < len(rollout_metadata) else {}
+        num_turns = len(rollout.trajectory)
+        for turn_idx in range(num_turns):
+            inference_top_logprobs = None
+            if include_top_logprobs:
+                if inference_top_logprobs_by_turn is not None and len(turn_metadata) < len(
+                    inference_top_logprobs_by_turn
+                ):
+                    inference_top_logprobs = inference_top_logprobs_by_turn[len(turn_metadata)]
+                rollout_top_logprobs = getattr(rollout, "top_logprobs", None)
+                if inference_top_logprobs is None and rollout_top_logprobs is not None and turn_idx < len(rollout_top_logprobs):
+                    inference_top_logprobs = rollout_top_logprobs[turn_idx]
+            turn_metadata.append(
+                {
+                    "group_index": metadata.get("group_index"),
+                    "rollout_index": metadata.get("rollout_index", local_rollout_idx),
+                    "global_rollout_index": metadata.get("global_rollout_index", local_rollout_idx),
+                    "turn_index": turn_idx,
+                    "env_id": getattr(rollout, "env_id", ""),
+                    "problem_id": getattr(rollout, "problem_id", None),
+                    "reward": _rollout_reward_scalar(getattr(rollout, "reward", None)),
+                    "routing_dump_id": (
+                        rollout.routing_dump_id[turn_idx]
+                        if isinstance(rollout, TokenRollout)
+                        and rollout.routing_dump_id is not None
+                        and turn_idx < len(rollout.routing_dump_id)
+                        else None
+                    ),
+                    "inference_top_logprobs": inference_top_logprobs,
+                }
+            )
+    return turn_metadata
+
+
+def _gather_logprob_mismatch_turn_metadata(
+    local_turn_metadata: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not dist.is_initialized():
+        return local_turn_metadata
+
+    dp_group = mpu.get_data_parallel_group()
+    gathered = [None] * dist.get_world_size(dp_group)
+    dist.all_gather_object(gathered, local_turn_metadata, group=dp_group)
+    return [item for rank_items in gathered for item in (rank_items or [])]
+
+
+def _prepare_inference_logit_moments(rollouts: Rollouts, seq_length: int):
+    means_rows, stds_rows = [], []
+    found = False
+    for rollout in rollouts:
+        rollout_means = getattr(rollout, "logit_means", None)
+        rollout_stds = getattr(rollout, "logit_stds", None)
+        if rollout_means is None or rollout_stds is None:
+            return None, None
+        for turn_idx, generation_mask in enumerate(rollout.generation_mask):
+            means_row = torch.full((seq_length - 1,), float("nan"), dtype=torch.float32)
+            stds_row = torch.full((seq_length - 1,), float("nan"), dtype=torch.float32)
+            turn_means = rollout_means[turn_idx] if turn_idx < len(rollout_means) else None
+            turn_stds = rollout_stds[turn_idx] if turn_idx < len(rollout_stds) else None
+            if turn_means is not None and turn_stds is not None and any(generation_mask):
+                first_gen_idx = max(0, generation_mask.index(True) - 1)
+                actual_len = min(len(turn_means), len(turn_stds), seq_length - 1 - first_gen_idx)
+                if actual_len > 0:
+                    means_row[first_gen_idx:first_gen_idx + actual_len] = torch.tensor(
+                        turn_means[:actual_len], dtype=torch.float32
+                    )
+                    stds_row[first_gen_idx:first_gen_idx + actual_len] = torch.tensor(
+                        turn_stds[:actual_len], dtype=torch.float32
+                    )
+                    found = True
+            means_rows.append(means_row)
+            stds_rows.append(stds_row)
+    if not found:
+        return None, None
+    return torch.stack(means_rows), torch.stack(stds_rows)
+
+
+def match_logits_to_inference_moments(
+    logits: torch.Tensor,
+    inference_logit_means: torch.Tensor | None,
+    inference_logit_stds: torch.Tensor | None,
+) -> torch.Tensor:
+    if inference_logit_means is None or inference_logit_stds is None:
+        return logits
+    target_means = inference_logit_means.to(device=logits.device, dtype=torch.float32)
+    target_stds = inference_logit_stds.to(device=logits.device, dtype=torch.float32)
+    valid = torch.isfinite(target_means) & torch.isfinite(target_stds) & (target_stds > 0)
+    if not valid.any():
+        return logits
+
+    logits_float = logits.float()
+    train_means = logits_float.mean(dim=-1)
+    train_stds = logits_float.std(dim=-1, unbiased=False).clamp_min(1e-6)
+    matched = (
+        (logits_float - train_means.unsqueeze(-1))
+        / train_stds.unsqueeze(-1)
+        * target_stds.unsqueeze(-1)
+        + target_means.unsqueeze(-1)
+    )
+    return torch.where(valid.unsqueeze(-1), matched, logits_float)
+
+
+def _detokenize_single_token(tokenizer: MegatronTokenizer | None, token_id: int) -> str:
+    if tokenizer is None:
+        return str(token_id)
+    try:
+        detok = tokenizer.detokenize([int(token_id)])
+        if isinstance(detok, list):
+            return "".join(str(part) for part in detok)
+        return str(detok)
+    except Exception:
+        return str(token_id)
+
+
+def _normalize_inference_top_logprobs(top_logprobs_row) -> tuple[list[str], list[float]]:
+    if not top_logprobs_row:
+        return [], []
+
+    tokens = []
+    logprobs = []
+    if isinstance(top_logprobs_row, dict):
+        iterable = [{"token": token, "logprob": logprob} for token, logprob in top_logprobs_row.items()]
+    else:
+        iterable = top_logprobs_row
+
+    for item in iterable:
+        if isinstance(item, dict):
+            token = item.get("token")
+            logprob = item.get("logprob")
+        else:
+            token = getattr(item, "token", None)
+            logprob = getattr(item, "logprob", None)
+        if token is None or logprob is None:
+            continue
+        tokens.append(str(token))
+        logprobs.append(float(logprob))
+    return tokens, logprobs
+
+
+def _rank_in_tokens(token: str, tokens: list[str]) -> int | None:
+    try:
+        return tokens.index(token) + 1
+    except ValueError:
+        return None
+
+
+def _top2_margin(logprobs: list[float]) -> float | None:
+    if len(logprobs) < 2:
+        return None
+    return float(logprobs[0] - logprobs[1])
+
+
+def _empty_topk_token_fields(num_tokens: int) -> dict[str, list[Any]]:
+    return {
+        "train_topk_tokens": [None] * num_tokens,
+        "train_topk_logprobs": [None] * num_tokens,
+        "train_topk_available": [False] * num_tokens,
+        "train_top1_token": [""] * num_tokens,
+        "train_top1_logprob": [float("nan")] * num_tokens,
+        "train_top2_token": [""] * num_tokens,
+        "train_top2_logprob": [float("nan")] * num_tokens,
+        "train_top2_margin": [float("nan")] * num_tokens,
+        "inference_topk_tokens": [None] * num_tokens,
+        "inference_topk_logprobs": [None] * num_tokens,
+        "inference_topk_available": [False] * num_tokens,
+        "inference_top1_token": [""] * num_tokens,
+        "inference_top1_logprob": [float("nan")] * num_tokens,
+        "inference_top2_token": [""] * num_tokens,
+        "inference_top2_logprob": [float("nan")] * num_tokens,
+        "inference_top2_margin": [float("nan")] * num_tokens,
+        "topk_token_overlap": [0] * num_tokens,
+        "topk_token_overlap_frac": [float("nan")] * num_tokens,
+        "sampled_token_train_rank": [0] * num_tokens,
+        "sampled_token_inference_rank": [0] * num_tokens,
+    }
+
+
+def _build_logprob_mismatch_candidate(
+    *,
+    old_logprobs: torch.Tensor,
+    inference_logprobs: torch.Tensor,
+    generation_mask: torch.Tensor,
+    tokens: torch.Tensor,
+    seq_index: int,
+    metadata: dict[str, Any] | None,
+    max_tokens: int,
+    train_topk_logprobs: torch.Tensor | None = None,
+    train_topk_indices: torch.Tensor | None = None,
+    topk_positions: int = 0,
+    tokenizer: MegatronTokenizer | None = None,
+) -> dict[str, Any] | None:
+    first_generated = _first_generated_token_index(generation_mask)
+    if first_generated is None:
+        return None
+
+    generated_positions = torch.nonzero(generation_mask.bool(), as_tuple=False).flatten()
+    generated_positions = generated_positions[generated_positions > 0]
+    if max_tokens > 0:
+        generated_positions = generated_positions[:max_tokens]
+    if generated_positions.numel() == 0:
+        return None
+
+    logprob_positions = generated_positions - 1
+    valid = (logprob_positions >= 0) & (logprob_positions < old_logprobs.numel())
+    valid &= logprob_positions < inference_logprobs.numel()
+    generated_positions = generated_positions[valid]
+    logprob_positions = logprob_positions[valid]
+    if generated_positions.numel() == 0:
+        return None
+
+    old_vals = old_logprobs.detach().float().cpu()[logprob_positions.cpu()]
+    inf_vals = inference_logprobs.detach().float().cpu()[logprob_positions.cpu()]
+    delta = old_vals - inf_vals
+    old_probs = old_vals.exp()
+    inf_probs = inf_vals.exp()
+    prob_abs_diff = (old_probs - inf_probs).abs()
+    prob_ratio = torch.exp(torch.clamp(delta, min=-80.0, max=80.0))
+
+    token_positions_cpu = generated_positions.cpu()
+    token_ids = tokens.detach().cpu()[token_positions_cpu].to(torch.long)
+    gen_offsets = token_positions_cpu - first_generated
+    phases = ["prefill" if int(pos.item()) == first_generated else "decode" for pos in token_positions_cpu]
+
+    metadata = metadata or {}
+    topk_fields = _empty_topk_token_fields(int(generated_positions.numel()))
+    if (
+        topk_positions > 0
+        and train_topk_logprobs is not None
+        and train_topk_indices is not None
+    ):
+        inference_top_logprobs = metadata.get("inference_top_logprobs") or []
+        num_topk_rows = min(topk_positions, prob_abs_diff.numel())
+        topk_row_indices = torch.topk(prob_abs_diff, k=num_topk_rows).indices.tolist()
+        for row_idx in topk_row_indices:
+            logprob_pos = int(logprob_positions[row_idx].item())
+            sampled_token_id = int(token_ids[row_idx].item())
+            sampled_token = _detokenize_single_token(tokenizer, sampled_token_id)
+
+            train_ids = train_topk_indices.detach().cpu()[logprob_pos].to(torch.long).tolist()
+            train_lps = train_topk_logprobs.detach().cpu()[logprob_pos].float().tolist()
+            train_tokens = [_detokenize_single_token(tokenizer, token_id) for token_id in train_ids]
+
+            gen_offset = int(gen_offsets[row_idx].item())
+            inf_tokens, inf_lps = (
+                _normalize_inference_top_logprobs(inference_top_logprobs[gen_offset])
+                if 0 <= gen_offset < len(inference_top_logprobs)
+                else ([], [])
+            )
+            if not inf_tokens:
+                # Some inference providers return only the sampled token logprob.
+                # Keep the inference top-k availability flag false, but expose the
+                # sampled token as a useful one-token proxy instead of leaving all
+                # inference-side fields blank.
+                inf_tokens = [sampled_token]
+                inf_lps = [float(inf_vals[row_idx].item())]
+
+            overlap = len(set(train_tokens) & set(inf_tokens))
+            denom = min(len(train_tokens), len(inf_tokens))
+            topk_fields["train_topk_tokens"][row_idx] = train_tokens
+            topk_fields["train_topk_logprobs"][row_idx] = [float(x) for x in train_lps]
+            topk_fields["train_topk_available"][row_idx] = bool(train_tokens)
+            topk_fields["train_top1_token"][row_idx] = train_tokens[0] if train_tokens else ""
+            topk_fields["train_top1_logprob"][row_idx] = (
+                float(train_lps[0]) if train_lps else float("nan")
+            )
+            topk_fields["train_top2_token"][row_idx] = (
+                train_tokens[1] if len(train_tokens) > 1 else ""
+            )
+            topk_fields["train_top2_logprob"][row_idx] = (
+                float(train_lps[1]) if len(train_lps) > 1 else float("nan")
+            )
+            topk_fields["train_top2_margin"][row_idx] = _top2_margin(train_lps)
+            topk_fields["inference_topk_tokens"][row_idx] = inf_tokens
+            topk_fields["inference_topk_logprobs"][row_idx] = [float(x) for x in inf_lps]
+            topk_fields["inference_topk_available"][row_idx] = bool(
+                0 <= gen_offset < len(inference_top_logprobs)
+                and inference_top_logprobs[gen_offset]
+            )
+            topk_fields["inference_top1_token"][row_idx] = (
+                inf_tokens[0] if inf_tokens else ""
+            )
+            topk_fields["inference_top1_logprob"][row_idx] = (
+                float(inf_lps[0]) if inf_lps else float("nan")
+            )
+            topk_fields["inference_top2_token"][row_idx] = (
+                inf_tokens[1] if len(inf_tokens) > 1 else ""
+            )
+            topk_fields["inference_top2_logprob"][row_idx] = (
+                float(inf_lps[1]) if len(inf_lps) > 1 else float("nan")
+            )
+            topk_fields["inference_top2_margin"][row_idx] = _top2_margin(inf_lps)
+            topk_fields["topk_token_overlap"][row_idx] = overlap
+            topk_fields["topk_token_overlap_frac"][row_idx] = (
+                float(overlap / denom) if denom > 0 else None
+            )
+            topk_fields["sampled_token_train_rank"][row_idx] = _rank_in_tokens(
+                sampled_token, train_tokens
+            )
+            topk_fields["sampled_token_inference_rank"][row_idx] = _rank_in_tokens(
+                sampled_token, inf_tokens
+            )
+
+    candidate = {
+        "seq_index": int(seq_index),
+        "rank": int(dist.get_rank()) if dist.is_initialized() else 0,
+        "group_index": metadata.get("group_index"),
+        "rollout_index": metadata.get("rollout_index"),
+        "global_rollout_index": metadata.get("global_rollout_index"),
+        "turn_index": metadata.get("turn_index"),
+        "env_id": metadata.get("env_id", ""),
+        "problem_id": metadata.get("problem_id"),
+        "reward": metadata.get("reward"),
+        "first_generated_token_index": int(first_generated),
+        "decode_start_token_index": int(first_generated + 1),
+        "token_index": [int(x.item()) for x in token_positions_cpu],
+        "gen_offset": [int(x.item()) for x in gen_offsets],
+        "token_id": [int(x.item()) for x in token_ids],
+        "phase": phases,
+        "train_logprob": old_vals.tolist(),
+        "inference_logprob": inf_vals.tolist(),
+        "logprob_delta": delta.tolist(),
+        "train_prob": old_probs.tolist(),
+        "inference_prob": inf_probs.tolist(),
+        "prob_abs_diff": prob_abs_diff.tolist(),
+        "prob_ratio": prob_ratio.tolist(),
+        "max_abs_logprob_delta": float(delta.abs().max().item()),
+        "max_prob_abs_diff": float(prob_abs_diff.max().item()),
+        "mean_abs_logprob_delta": float(delta.abs().mean().item()),
+        "mean_prob_abs_diff": float(prob_abs_diff.mean().item()),
+        "num_tokens": int(generated_positions.numel()),
+        **topk_fields,
+    }
+    return candidate
+
+
+def _extract_unpacked_logprob_mismatch_candidates(
+    *,
+    old_logprobs: torch.Tensor,
+    inference_logprobs: torch.Tensor | None,
+    generation_masks: torch.Tensor,
+    trajs: torch.Tensor,
+    turn_metadata: list[dict[str, Any]] | None,
+    max_tokens: int,
+    train_topk_logprobs: torch.Tensor | None = None,
+    train_topk_indices: torch.Tensor | None = None,
+    topk_positions: int = 0,
+    tokenizer: MegatronTokenizer | None = None,
+) -> list[dict[str, Any]]:
+    if inference_logprobs is None:
+        return []
+
+    candidates = []
+    for seq_index in range(generation_masks.shape[0]):
+        metadata = turn_metadata[seq_index] if turn_metadata and seq_index < len(turn_metadata) else None
+        candidate = _build_logprob_mismatch_candidate(
+            old_logprobs=old_logprobs[seq_index],
+            inference_logprobs=inference_logprobs[seq_index],
+            generation_mask=generation_masks[seq_index],
+            tokens=trajs[seq_index],
+            seq_index=seq_index,
+            metadata=metadata,
+            max_tokens=max_tokens,
+            train_topk_logprobs=(
+                train_topk_logprobs[seq_index] if train_topk_logprobs is not None else None
+            ),
+            train_topk_indices=(
+                train_topk_indices[seq_index] if train_topk_indices is not None else None
+            ),
+            topk_positions=topk_positions,
+            tokenizer=tokenizer,
+        )
+        if candidate is not None:
+            candidates.append(candidate)
+    return candidates
+
+
+def _extract_packed_logprob_mismatch_candidates(
+    *,
+    old_logprobs: torch.Tensor,
+    packed_inference_logprobs: torch.Tensor | None,
+    packing_context: Any,
+    turn_metadata: list[dict[str, Any]] | None,
+    max_tokens: int,
+    train_topk_logprobs: torch.Tensor | None = None,
+    train_topk_indices: torch.Tensor | None = None,
+    topk_positions: int = 0,
+    tokenizer: MegatronTokenizer | None = None,
+) -> list[dict[str, Any]]:
+    if packed_inference_logprobs is None:
+        return []
+
+    candidates = []
+    packing_info = packing_context.packing_info
+    old_logprobs = old_logprobs.cpu()
+    packed_inference_logprobs = packed_inference_logprobs.cpu()
+    if train_topk_logprobs is not None:
+        train_topk_logprobs = train_topk_logprobs.cpu()
+    if train_topk_indices is not None:
+        train_topk_indices = train_topk_indices.cpu()
+    for local_bin_idx, seq_indices in enumerate(packing_info.bin_seq_indices):
+        seq_starts = packing_info.seq_starts[local_bin_idx]
+        for seq_pos_in_bin, seq_index in enumerate(seq_indices):
+            seq_start = seq_starts[seq_pos_in_bin]
+            seq_len = packing_info.seq_lengths[seq_index]
+            if seq_len <= 1:
+                continue
+
+            seq_slice = slice(seq_start, seq_start + seq_len - 1)
+            metadata = (
+                turn_metadata[seq_index]
+                if turn_metadata is not None and seq_index < len(turn_metadata)
+                else None
+            )
+            candidate = _build_logprob_mismatch_candidate(
+                old_logprobs=old_logprobs[local_bin_idx, seq_slice],
+                inference_logprobs=packed_inference_logprobs[local_bin_idx, seq_slice],
+                generation_mask=packing_context.original_generation_masks[seq_index, :seq_len],
+                tokens=packing_context.original_trajs[seq_index, :seq_len],
+                seq_index=seq_index,
+                metadata=metadata,
+                max_tokens=max_tokens,
+                train_topk_logprobs=(
+                    train_topk_logprobs[local_bin_idx, seq_slice]
+                    if train_topk_logprobs is not None
+                    else None
+                ),
+                train_topk_indices=(
+                    train_topk_indices[local_bin_idx, seq_slice]
+                    if train_topk_indices is not None
+                    else None
+                ),
+                topk_positions=topk_positions,
+                tokenizer=tokenizer,
+            )
+            if candidate is not None:
+                candidates.append(candidate)
+    return candidates
+
+
+def _select_logprob_mismatch_candidates(
+    candidates: list[dict[str, Any]],
+    num_examples: int,
+    selection: str,
+) -> list[dict[str, Any]]:
+    if num_examples <= 0:
+        return []
+    if selection == "first":
+        return candidates[:num_examples]
+
+    per_group = selection.endswith("_per_group")
+    base_selection = selection.removesuffix("_per_group")
+    score_key = "max_prob_abs_diff" if base_selection == "top_prob_abs_diff" else "max_abs_logprob_delta"
+    sorted_candidates = sorted(
+        candidates,
+        key=lambda candidate: (
+            -candidate.get(score_key, 0.0),
+            candidate.get("rank", 0),
+            candidate.get("seq_index", 0),
+        ),
+    )
+    if not per_group:
+        return sorted_candidates[:num_examples]
+
+    selected = []
+    selected_groups = set()
+    for candidate in sorted_candidates:
+        group_key = candidate.get("group_index")
+        if group_key is None:
+            group_key = ("ungrouped", candidate.get("rank", 0), candidate.get("seq_index", 0))
+        if group_key in selected_groups:
+            continue
+        selected.append(candidate)
+        selected_groups.add(group_key)
+        if len(selected) == num_examples:
+            return selected
+
+    # If fewer groups exist than requested examples, fill remaining slots with the next-best candidates.
+    selected_ids = {id(candidate) for candidate in selected}
+    for candidate in sorted_candidates:
+        if id(candidate) in selected_ids:
+            continue
+        selected.append(candidate)
+        if len(selected) == num_examples:
+            break
+    return selected
+
+
+def _is_logprob_mismatch_canonical_rank() -> bool:
+    if not dist.is_initialized():
+        return True
+    return (
+        mpu.get_tensor_model_parallel_rank() == 0
+        and mpu.get_pipeline_model_parallel_rank() == 0
+    )
+
+
+def _select_global_logprob_mismatch_candidates(
+    local_candidates: list[dict[str, Any]],
+    num_examples: int,
+    selection: str,
+) -> list[dict[str, Any]]:
+    if not dist.is_initialized():
+        return _select_logprob_mismatch_candidates(local_candidates, num_examples, selection)
+
+    selected = None
+    if _is_logprob_mismatch_canonical_rank():
+        dp_group = mpu.get_data_parallel_group()
+        gathered = [None] * dist.get_world_size(dp_group)
+        dist.all_gather_object(gathered, local_candidates, group=dp_group)
+        if dist.get_rank() == 0:
+            all_candidates = [item for rank_items in gathered for item in (rank_items or [])]
+            selected = _select_logprob_mismatch_candidates(
+                all_candidates, num_examples, selection
+            )
+
+    broadcast_payload = [selected]
+    dist.broadcast_object_list(broadcast_payload, src=0)
+    return broadcast_payload[0] or []
+
+
+def _binned_median_line(x_values: list[int], y_values: list[float], max_bins: int = 256):
+    if len(x_values) < 128:
+        return None, None
+    x_array = np.asarray(x_values)
+    y_array = np.asarray(y_values)
+    num_bins = min(max_bins, max(1, len(x_values) // 64))
+    bins = np.linspace(x_array.min(), x_array.max() + 1, num_bins + 1)
+    x_medians = []
+    y_medians = []
+    for start, end in zip(bins[:-1], bins[1:]):
+        mask = (x_array >= start) & (x_array < end)
+        if np.any(mask):
+            x_medians.append(float(np.median(x_array[mask])))
+            y_medians.append(float(np.median(y_array[mask])))
+    return x_medians, y_medians
+
+
+def _make_logprob_mismatch_figure(candidate: dict[str, Any], iteration: int):
+    import matplotlib.pyplot as plt
+
+    plt.switch_backend('agg')
+    x_values = candidate["gen_offset"]
+    delta_values = candidate["logprob_delta"]
+    prob_diff_values = candidate["prob_abs_diff"]
+    fig, axes = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
+    title_bits = [
+        f"iter={iteration}",
+        f"rank={candidate.get('rank')}",
+        f"seq={candidate.get('seq_index')}",
+    ]
+    if candidate.get("env_id"):
+        title_bits.append(f"env={candidate['env_id']}")
+    if candidate.get("problem_id") is not None:
+        title_bits.append(f"problem={candidate['problem_id']}")
+    fig.suptitle("Logprob mismatch: " + ", ".join(title_bits))
+
+    axes[0].scatter(x_values, delta_values, s=2, alpha=0.45, rasterized=True)
+    axes[0].axhline(0.0, color='black', linewidth=0.8, linestyle='--')
+    axes[0].set_ylabel("train_lp - inf_lp")
+
+    axes[1].scatter(x_values, prob_diff_values, s=2, alpha=0.45, rasterized=True)
+    axes[1].set_ylabel("|train_p - inf_p|")
+    axes[1].set_xlabel("generated token offset")
+
+    for ax, y_values in zip(axes, [delta_values, prob_diff_values]):
+        median_x, median_y = _binned_median_line(x_values, y_values)
+        if median_x:
+            ax.plot(median_x, median_y, color='red', linewidth=1.0, label='binned median')
+            ax.legend(loc='best', fontsize=8)
+        ax.axvline(0, color='green', linestyle='--', linewidth=1.0, label='prefill logprob')
+        if len(x_values) > 1:
+            ax.axvline(1, color='purple', linestyle=':', linewidth=1.0, label='decode start')
+        ax.grid(True, alpha=0.25)
+
+    fig.tight_layout()
+    return fig
+
+
+def _json_table_cell(value):
+    if value is None:
+        return None
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _wandb_log_logprob_mismatch_candidates(
+    candidates: list[dict[str, Any]],
+    iteration: int,
+) -> None:
+    wandb_writer = get_wandb_writer()
+    if wandb_writer is None or not candidates:
+        return
+
+    try:
+        import matplotlib.pyplot as plt
+        import wandb as _wandb
+
+        token_rows = []
+        plot_rows = []
+        for example_idx, candidate in enumerate(candidates):
+            fig = _make_logprob_mismatch_figure(candidate, iteration)
+            plot_rows.append(
+                [
+                    example_idx,
+                    candidate.get("rank"),
+                    candidate.get("seq_index"),
+                    candidate.get("env_id"),
+                    candidate.get("problem_id"),
+                    candidate.get("reward"),
+                    candidate.get("num_tokens"),
+                    candidate.get("max_abs_logprob_delta"),
+                    candidate.get("max_prob_abs_diff"),
+                    _wandb.Image(fig),
+                ]
+            )
+            plt.close(fig)
+
+            for row_idx in range(candidate["num_tokens"]):
+                token_rows.append(
+                    [
+                        iteration,
+                        example_idx,
+                        candidate.get("rank"),
+                        candidate.get("group_index"),
+                        candidate.get("rollout_index"),
+                        candidate.get("turn_index"),
+                        candidate.get("env_id"),
+                        candidate.get("problem_id"),
+                        candidate.get("reward"),
+                        candidate["token_index"][row_idx],
+                        candidate["gen_offset"][row_idx],
+                        candidate["token_id"][row_idx],
+                        candidate["phase"][row_idx],
+                        candidate["train_logprob"][row_idx],
+                        candidate["inference_logprob"][row_idx],
+                        candidate["logprob_delta"][row_idx],
+                        candidate["train_prob"][row_idx],
+                        candidate["inference_prob"][row_idx],
+                        candidate["prob_abs_diff"][row_idx],
+                        candidate["prob_ratio"][row_idx],
+                        _json_table_cell(candidate["train_topk_tokens"][row_idx]),
+                        _json_table_cell(candidate["train_topk_logprobs"][row_idx]),
+                        candidate["train_topk_available"][row_idx],
+                        candidate["train_top1_token"][row_idx],
+                        candidate["train_top1_logprob"][row_idx],
+                        candidate["train_top2_token"][row_idx],
+                        candidate["train_top2_logprob"][row_idx],
+                        candidate["train_top2_margin"][row_idx],
+                        _json_table_cell(candidate["inference_topk_tokens"][row_idx]),
+                        _json_table_cell(candidate["inference_topk_logprobs"][row_idx]),
+                        candidate["inference_topk_available"][row_idx],
+                        candidate["inference_top1_token"][row_idx],
+                        candidate["inference_top1_logprob"][row_idx],
+                        candidate["inference_top2_token"][row_idx],
+                        candidate["inference_top2_logprob"][row_idx],
+                        candidate["inference_top2_margin"][row_idx],
+                        candidate["topk_token_overlap"][row_idx],
+                        candidate["topk_token_overlap_frac"][row_idx],
+                        candidate["sampled_token_train_rank"][row_idx],
+                        candidate["sampled_token_inference_rank"][row_idx],
+                    ]
+                )
+
+        metrics = {
+            "rl/logprob_mismatch/token_table": wandb_writer.Table(
+                columns=[
+                    "iteration",
+                    "example_index",
+                    "rank",
+                    "group_index",
+                    "rollout_index",
+                    "turn_index",
+                    "env_id",
+                    "problem_id",
+                    "reward",
+                    "token_index",
+                    "gen_offset",
+                    "token_id",
+                    "phase",
+                    "train_logprob",
+                    "inference_logprob",
+                    "logprob_delta",
+                    "train_prob",
+                    "inference_prob",
+                    "prob_abs_diff",
+                    "prob_ratio",
+                    "train_topk_tokens_json",
+                    "train_topk_logprobs_json",
+                    "train_topk_available",
+                    "train_top1_token",
+                    "train_top1_logprob",
+                    "train_top2_token",
+                    "train_top2_logprob",
+                    "train_top2_margin",
+                    "inference_topk_tokens_json",
+                    "inference_topk_logprobs_json",
+                    "inference_topk_available",
+                    "inference_top1_token",
+                    "inference_top1_logprob",
+                    "inference_top2_token",
+                    "inference_top2_logprob",
+                    "inference_top2_margin",
+                    "topk_token_overlap",
+                    "topk_token_overlap_frac",
+                    "sampled_token_train_rank",
+                    "sampled_token_inference_rank",
+                ],
+                data=token_rows,
+            ),
+            "rl/logprob_mismatch/rollout_plots": wandb_writer.Table(
+                columns=[
+                    "example_index",
+                    "rank",
+                    "seq_index",
+                    "env_id",
+                    "problem_id",
+                    "reward",
+                    "num_tokens",
+                    "max_abs_logprob_delta",
+                    "max_prob_abs_diff",
+                    "plot",
+                ],
+                data=plot_rows,
+            ),
+        }
+        wandb_writer.log(metrics, step=iteration)
+    except Exception as e:
+        print_rank_0(f"[Logprob-mismatch] W&B plot creation failed: {e}")
+
+
+def _maybe_log_logprob_mismatch_diagnostics(
+    *,
+    old_logprobs: torch.Tensor,
+    inference_logprobs: torch.Tensor | None,
+    generation_masks: torch.Tensor | None,
+    trajs: torch.Tensor | None,
+    packing_context: Any | None,
+    turn_metadata: list[dict[str, Any]] | None,
+    iteration: int,
+    train_topk_logprobs: torch.Tensor | None = None,
+    train_topk_indices: torch.Tensor | None = None,
+) -> None:
+    args = get_args()
+    num_examples = getattr(args, "rl_logprob_mismatch_num_examples", 0)
+    if num_examples <= 0:
+        return
+
+    local_candidates = []
+    if _is_logprob_mismatch_canonical_rank() and inference_logprobs is not None:
+        max_tokens = getattr(args, "rl_logprob_mismatch_max_tokens", 0)
+        topk_positions = (
+            getattr(args, "rl_logprob_mismatch_topk_positions", 0)
+            if getattr(args, "rl_logprob_mismatch_top_k", 0) > 0
+            else 0
+        )
+        tokenizer = get_tokenizer() if topk_positions > 0 else None
+        if packing_context is None:
+            local_candidates = _extract_unpacked_logprob_mismatch_candidates(
+                old_logprobs=old_logprobs,
+                inference_logprobs=inference_logprobs,
+                generation_masks=generation_masks,
+                trajs=trajs,
+                turn_metadata=turn_metadata,
+                max_tokens=max_tokens,
+                train_topk_logprobs=train_topk_logprobs,
+                train_topk_indices=train_topk_indices,
+                topk_positions=topk_positions,
+                tokenizer=tokenizer,
+            )
+        else:
+            local_candidates = _extract_packed_logprob_mismatch_candidates(
+                old_logprobs=old_logprobs,
+                packed_inference_logprobs=inference_logprobs,
+                packing_context=packing_context,
+                turn_metadata=turn_metadata,
+                max_tokens=max_tokens,
+                train_topk_logprobs=train_topk_logprobs,
+                train_topk_indices=train_topk_indices,
+                topk_positions=topk_positions,
+                tokenizer=tokenizer,
+            )
+
+    selected = _select_global_logprob_mismatch_candidates(
+        local_candidates,
+        num_examples,
+        getattr(args, "rl_logprob_mismatch_selection", "top_abs_delta"),
+    )
+    _wandb_log_logprob_mismatch_candidates(selected, iteration)
+
+
 def get_agent(args, parallel_generation_tasks: int | None = None):
     """Get an agent based on environment configuration.
 
@@ -550,8 +1386,16 @@ def get_environment_rollouts(
     nvtx_range = get_nvtx_range()
 
     router_dump_dir = os.environ.get("ROUTER_STUDY_DUMP_DIR", "")
+    if probe_needs_rollout_ids(args):
+        os.environ["RL_DETERMINISM_PROBE_DIR"] = str(
+            args.rl_determinism_probe_dir or args.rl_determinism_probe_write_targets_file
+        )
+        os.environ["ROUTER_STUDY_COLLECTION_ID"] = str(getattr(args, "curr_iteration", 0))
     if router_dump_dir:
         os.environ["ROUTER_STUDY_COLLECTION_ID"] = str(getattr(args, "curr_iteration", 0))
+        topk_for_dump = getattr(args, "rl_logprob_mismatch_top_k", 0)
+        if topk_for_dump > 0:
+            os.environ["ROUTER_STUDY_DUMP_TOPK"] = str(topk_for_dump)
         if not dist.is_initialized() or dist.get_rank() == 0:
             dump_path = Path(router_dump_dir)
             dump_path.mkdir(parents=True, exist_ok=True)
@@ -664,6 +1508,249 @@ def get_environment_rollouts(
     return rollouts
 
 
+async def _score_prefill_rollouts_on_rank0(inference_interface, rollout_paths, args):
+    rows = []
+    per_rollout_delta_lp = []
+    per_rollout_delta_p = []
+
+    for file_idx, path in enumerate(rollout_paths):
+        with np.load(path) as data:
+            prompt_tokens = data["prompt_tokens"].astype(np.int64).tolist()
+            generated_tokens = data["generated_tokens"].astype(np.int64).tolist()
+            if "generated_log_probs" not in data:
+                print_rank_0(
+                    f"[Prefill-rescore] {file_idx + 1}/{len(rollout_paths)} "
+                    f"skipping {os.path.basename(path)}: missing generated_log_probs"
+                )
+                continue
+            decode_logprobs = data["generated_log_probs"].astype(np.float32)
+
+        if not generated_tokens or len(decode_logprobs) == 0:
+            print_rank_0(
+                f"[Prefill-rescore] {file_idx + 1}/{len(rollout_paths)} "
+                f"skipping {os.path.basename(path)}: empty generated tokens/logprobs"
+            )
+            continue
+        full_tokens = prompt_tokens + generated_tokens
+        print_rank_0(
+            f"[Prefill-rescore] {file_idx + 1}/{len(rollout_paths)} scoring "
+            f"{os.path.basename(path)} prompt_len={len(prompt_tokens)} "
+            f"gen_len={len(generated_tokens)} total_len={len(full_tokens)}"
+        )
+        if len(full_tokens) + 1 > args.inference_max_seq_length:
+            rows.append(
+                {
+                    "path": path,
+                    "status": "skipped_too_long",
+                    "num_tokens": len(full_tokens),
+                    "inference_max_seq_length": args.inference_max_seq_length,
+                }
+            )
+            print_rank_0(
+                f"[Prefill-rescore] {file_idx + 1}/{len(rollout_paths)} skipped: "
+                f"total_len={len(full_tokens)} exceeds inference_max_seq_length={args.inference_max_seq_length}"
+            )
+            continue
+
+        try:
+            prompt_logprobs = await asyncio.wait_for(
+                inference_interface.score_prompt_logprobs(full_tokens),
+                timeout=args.rl_prefill_rescore_timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            rows.append(
+                {
+                    "path": path,
+                    "status": "timeout",
+                    "timeout_seconds": args.rl_prefill_rescore_timeout_seconds,
+                    "prompt_len": len(prompt_tokens),
+                    "generated_len": len(generated_tokens),
+                    "total_len": len(full_tokens),
+                }
+            )
+            print_rank_0(
+                f"[Prefill-rescore] {file_idx + 1}/{len(rollout_paths)} timed out after "
+                f"{args.rl_prefill_rescore_timeout_seconds}s; stopping diagnostic early"
+            )
+            break
+        if prompt_logprobs is None:
+            rows.append({"path": path, "status": "missing_prompt_logprobs"})
+            print_rank_0(
+                f"[Prefill-rescore] {file_idx + 1}/{len(rollout_paths)} failed: "
+                "missing prompt_logprobs"
+            )
+            continue
+
+        start = len(prompt_tokens) - 1
+        end = start + len(generated_tokens)
+        prefill_logprobs = np.asarray(prompt_logprobs[start:end], dtype=np.float32)
+        n = min(len(prefill_logprobs), len(decode_logprobs), len(generated_tokens))
+        if n == 0:
+            rows.append({"path": path, "status": "empty_aligned_logprobs"})
+            continue
+
+        prefill_logprobs = prefill_logprobs[:n]
+        decode_logprobs = decode_logprobs[:n]
+        delta_lp = prefill_logprobs - decode_logprobs
+        delta_p = np.abs(np.exp(prefill_logprobs) - np.exp(decode_logprobs))
+        per_rollout_delta_lp.append(torch.tensor(delta_lp, dtype=torch.float32))
+        per_rollout_delta_p.append(torch.tensor(delta_p, dtype=torch.float32))
+        rows.append(
+            {
+                "path": path,
+                "status": "ok",
+                "prompt_len": len(prompt_tokens),
+                "generated_len": n,
+                "mean_abs_logprob_delta": float(np.mean(np.abs(delta_lp))),
+                "max_abs_logprob_delta": float(np.max(np.abs(delta_lp))),
+                "mean_prob_abs_diff": float(np.mean(delta_p)),
+                "max_prob_abs_diff": float(np.max(delta_p)),
+            }
+        )
+        print_rank_0(
+            f"[Prefill-rescore] {file_idx + 1}/{len(rollout_paths)} done: "
+            f"mean|Δlp|={np.mean(np.abs(delta_lp)):.6f} "
+            f"max|Δlp|={np.max(np.abs(delta_lp)):.6f} "
+            f"mean|Δp|={np.mean(delta_p):.6f} "
+            f"max|Δp|={np.max(delta_p):.6f}"
+        )
+        await asyncio.sleep(0.5)
+
+    return rows, per_rollout_delta_lp, per_rollout_delta_p
+
+
+def _pad_1d_tensors_for_numpy(tensors: list[torch.Tensor]) -> np.ndarray:
+    if not tensors:
+        return np.empty((0, 0), dtype=np.float32)
+    max_len = max(t.numel() for t in tensors)
+    padded = []
+    for tensor in tensors:
+        if tensor.numel() < max_len:
+            pad = tensor.new_full((max_len - tensor.numel(),), float("nan"))
+            tensor = torch.cat([tensor, pad], dim=0)
+        padded.append(tensor)
+    return torch.stack(padded).numpy().astype(np.float32)
+
+
+def run_prefill_rescore_diagnostic(
+    model: list[LanguageModule],
+    inference_model: list[LanguageModule] | None,
+    optimizer: MegatronOptimizer,
+    args,
+) -> None:
+    """Compare saved decode logprobs with full-prefill inference prompt logprobs."""
+    import glob as _glob
+
+    if not hasattr(args, "curr_iteration"):
+        args.curr_iteration = 0
+
+    rollout_file = args.rl_prefill_rescore_rollout_file
+    rollout_dir = args.rl_prefill_rescore_rollout_dir
+    results_dir = (
+        args.rl_prefill_rescore_results_dir
+        or (os.path.dirname(rollout_file) if rollout_file else rollout_dir)
+    )
+    if torch.distributed.get_rank() == 0:
+        os.makedirs(results_dir, exist_ok=True)
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
+    rollout_paths = []
+    if torch.distributed.get_rank() == 0:
+        if rollout_file:
+            rollout_paths = [rollout_file]
+        else:
+            rollout_paths = sorted(_glob.glob(os.path.join(rollout_dir, "rollout_*.npz")))
+        if not rollout_file and args.rl_prefill_rescore_max_rollouts > 0:
+            rollout_paths = rollout_paths[: args.rl_prefill_rescore_max_rollouts]
+        print_rank_0(
+            f"[Prefill-rescore] scoring {len(rollout_paths)} rollout dump(s) from "
+            f"{rollout_file or rollout_dir}"
+        )
+
+    original_return_log_probs = getattr(args, "return_log_probs", False)
+    args.return_log_probs = True
+    inference_model_to_use = inference_model if inference_model is not None else model
+    if inference_model is not None:
+        inf_core = unwrap_model(inference_model[0])
+        _maybe_prefetch_separate_inference_model_weights(inf_core, to_cpu=False)
+        swap_model_weights(model, inference_model, args.refit_method)
+
+    with megatron_rl_inference_mode(
+        inference_model_to_use,
+        optimizer,
+        args.cuda_graph_impl,
+        False,
+        training_model=model if inference_model is not None else None,
+    ) as inference_interface:
+        if torch.distributed.get_rank() == 0:
+            loop = get_asyncio_loop()
+            rows, delta_lp_tensors, delta_p_tensors = loop.run_until_complete(
+                _score_prefill_rollouts_on_rank0(inference_interface, rollout_paths, args)
+            )
+        else:
+            rows, delta_lp_tensors, delta_p_tensors = None, None, None
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+
+    args.return_log_probs = original_return_log_probs
+
+    if torch.distributed.get_rank() != 0:
+        return
+
+    ok_rows = [row for row in rows if row.get("status") == "ok"]
+    flat_lp = (
+        torch.cat([tensor.abs() for tensor in delta_lp_tensors])
+        if delta_lp_tensors
+        else torch.tensor([], dtype=torch.float32)
+    )
+    flat_p = (
+        torch.cat(delta_p_tensors)
+        if delta_p_tensors
+        else torch.tensor([], dtype=torch.float32)
+    )
+    summary = {
+        "num_rollout_files": len(rollout_paths),
+        "num_scored": len(ok_rows),
+        "num_failed_or_skipped": len(rows) - len(ok_rows),
+        "logprob_abs_delta": (
+            {
+                "mean": float(flat_lp.mean().item()),
+                "p50": float(flat_lp.quantile(0.50).item()),
+                "p95": float(flat_lp.quantile(0.95).item()),
+                "p99": float(flat_lp.quantile(0.99).item()),
+                "max": float(flat_lp.max().item()),
+            }
+            if flat_lp.numel() > 0
+            else {}
+        ),
+        "prob_abs_diff": (
+            {
+                "mean": float(flat_p.mean().item()),
+                "p50": float(flat_p.quantile(0.50).item()),
+                "p95": float(flat_p.quantile(0.95).item()),
+                "p99": float(flat_p.quantile(0.99).item()),
+                "max": float(flat_p.max().item()),
+            }
+            if flat_p.numel() > 0
+            else {}
+        ),
+        "rollouts": rows,
+    }
+    out_json = os.path.join(results_dir, "prefill_vs_decode_rescore.json")
+    with open(out_json, "w") as f:
+        json.dump(summary, f, indent=2)
+    np.save(
+        os.path.join(results_dir, "prefill_vs_decode_logprob_delta.npy"),
+        _pad_1d_tensors_for_numpy(delta_lp_tensors),
+    )
+    np.save(
+        os.path.join(results_dir, "prefill_vs_decode_prob_delta.npy"),
+        _pad_1d_tensors_for_numpy(delta_p_tensors),
+    )
+    print_rank_0(f"[Prefill-rescore] saved → {out_json}")
+
+
 def selective_log_softmax(logits, index):
     """Taken from: https://github.com/huggingface/trl/blob/26d86757a7c7e24e397ea44f57ecce6031dfac01/trl/trainer/utils.py#L1659.
 
@@ -705,7 +1792,29 @@ def selective_log_softmax(logits, index):
     return per_token_logps
 
 
-def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=False, packed_seq_params=None):
+def topk_log_softmax(logits: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return top-k token ids and logprobs without materializing full log-softmax output."""
+    topk_logprobs = []
+    topk_indices = []
+    for row_logits in logits:
+        row_topk_logits, row_topk_indices = torch.topk(row_logits, k, dim=-1)
+        row_logsumexp = torch.logsumexp(row_logits.float(), dim=-1, keepdim=True)
+        topk_logprobs.append(row_topk_logits.float() - row_logsumexp)
+        topk_indices.append(row_topk_indices)
+    return torch.stack(topk_logprobs), torch.stack(topk_indices)
+
+
+def get_logprobs(
+    model,
+    tokens,
+    position_ids,
+    no_grad=False,
+    sequence_packing=False,
+    packed_seq_params=None,
+    topk_logprobs: int = 0,
+    inference_logit_means: torch.Tensor | None = None,
+    inference_logit_stds: torch.Tensor | None = None,
+):
     """Get sequence logprobs from their token ids.
 
     Args:
@@ -781,7 +1890,27 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
             logits = logits_or_hidden_states
             with nvtx_range("log-softmax", time=False):
                 # We do not need logprobs for the n+1 token.
-                logprobs = selective_log_softmax(logits[:, :-1, :], tokens[:, 1:])
+                logits_for_targets = logits[:, :-1, :]
+                logits_for_targets = match_logits_to_inference_moments(
+                    logits_for_targets, inference_logit_means, inference_logit_stds
+                )
+                logprobs = selective_log_softmax(logits_for_targets, tokens[:, 1:])
+                selected_logprobs_for_probe = torch.full(
+                    tokens.shape,
+                    float("nan"),
+                    dtype=logprobs.dtype,
+                    device=logprobs.device,
+                )
+                selected_logprobs_for_probe[:, :-1] = logprobs
+                probe_tensor_point(
+                    "lm_selected_logprob",
+                    selected_logprobs_for_probe.unsqueeze(-1),
+                )
+                if topk_logprobs > 0:
+                    topk_values, topk_indices = topk_log_softmax(
+                        logits_for_targets, topk_logprobs
+                    )
+                    _LOGPROBS_TOPK_BUFFER.append((topk_values.detach(), topk_indices.detach()))
             return logprobs
 
 
@@ -1262,10 +2391,24 @@ def prepare_trajectories(
     )
 
 
-def logprobs_forward_step(data_iterator, model, is_correction, packing_context=None, replay_enabled=False):
+def logprobs_forward_step(
+    data_iterator,
+    model,
+    is_correction,
+    packing_context=None,
+    replay_enabled=False,
+    topk_logprobs: int = 0,
+    match_logit_moments: bool = False,
+    probe_turn_metadata=None,
+    probe_generation_masks=None,
+    probe_iteration: int = 0,
+    probe_phase: str = "training_old_logprobs",
+):
     # Avoid self.training checks which will trigger cudagraph capture; this path reuses
     # the forward pass from training after it has been captured on the 1st iteration.
     model.eval()
+    b_logit_means, b_logit_stds = None, None
+    b_probe_seq_indices = None
 
     if packing_context is not None:
         # When using sequence packing, the data iterator returns a tuple with a single element, the bin index.
@@ -1276,7 +2419,15 @@ def logprobs_forward_step(data_iterator, model, is_correction, packing_context=N
         )
     else:
         if replay_enabled:
-            b_trajs, b_posids, b_routing, b_seq_mask = next(data_iterator)
+            batch = next(data_iterator)
+            if len(batch) in (5, 7):
+                b_probe_seq_indices = batch[-1]
+                batch = batch[:-1]
+            if len(batch) == 6:
+                b_trajs, b_posids, b_routing, b_seq_mask, b_logit_means, b_logit_stds = batch
+            else:
+                b_trajs, b_posids, b_routing, b_seq_mask = batch
+                b_logit_means, b_logit_stds = None, None
             from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
             replay_mask = b_seq_mask.view(-1).cuda()
             flat = b_routing.view(-1, b_routing.shape[2], b_routing.shape[3])
@@ -1284,20 +2435,57 @@ def logprobs_forward_step(data_iterator, model, is_correction, packing_context=N
             RouterReplay.set_replay_data(layer_tensors, replay_mask)
             RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
         else:
-            b_trajs, b_posids, _, _ = next(data_iterator)
+            batch = next(data_iterator)
+            if len(batch) in (5, 7):
+                b_probe_seq_indices = batch[-1]
+                batch = batch[:-1]
+            if len(batch) == 6:
+                b_trajs, b_posids, _, _, b_logit_means, b_logit_stds = batch
+            else:
+                b_trajs, b_posids, _, _ = batch
+                b_logit_means, b_logit_stds = None, None
         b_packed_seq_params = None
+    if not match_logit_moments:
+        b_logit_means, b_logit_stds = None, None
 
-    logprobs = (
-        get_logprobs(
+    probe_context = nullcontext()
+    if (
+        packing_context is None
+        and b_probe_seq_indices is not None
+        and probe_turn_metadata is not None
+        and probe_generation_masks is not None
+    ):
+        token_metadata = build_training_token_metadata(
+            tokens=b_trajs,
+            generation_masks=probe_generation_masks,
+            seq_indices=b_probe_seq_indices,
+            turn_metadata=probe_turn_metadata,
+            iteration=probe_iteration,
+            phase=probe_phase,
+        )
+        probe_context = probe_scope(
+            phase=probe_phase,
+            iteration=probe_iteration,
+            token_metadata=token_metadata,
+            batch_size=int(b_trajs.shape[0]),
+            seq_length=int(b_trajs.shape[1]),
+            extra={"seq_indices": b_probe_seq_indices.detach().cpu().tolist()},
+            probe=get_determinism_probe(model),
+        )
+
+    with probe_context:
+        logprobs_value = get_logprobs(
             model,
             b_trajs.cuda(),
             b_posids.cuda(),
             no_grad=True,
             sequence_packing=packing_context is not None,
             packed_seq_params=b_packed_seq_params,
-        ),
-        None,
-    )
+            topk_logprobs=topk_logprobs,
+            inference_logit_means=b_logit_means.cuda() if b_logit_means is not None else None,
+            inference_logit_stds=b_logit_stds.cuda() if b_logit_stds is not None else None,
+        )
+    logprobs = (logprobs_value, None)
 
     if replay_enabled and packing_context is None:
         from megatron.core.transformer.moe.router_replay import RouterReplay
@@ -1322,17 +2510,42 @@ def compute_logprobs_batch(
     is_correction,
     collect_non_loss_data=False,
     replay_enabled=False,
+    topk_logprobs: int = 0,
+    match_logit_moments: bool = False,
+    probe_turn_metadata=None,
+    probe_generation_masks=None,
+    probe_iteration: int = 0,
+    probe_phase: str = "training_old_logprobs",
 ):
     """Compute logprobs for all batches in the data loader."""
+    global _LOGPROBS_TOPK_BUFFER
+    _LOGPROBS_TOPK_BUFFER = []
+    args = get_args()
+    if probe_enabled(args):
+        model_for_probe = model[0] if isinstance(model, list) else model
+        ensure_determinism_probe(model_for_probe, args)
     if replay_enabled:
         from megatron.core.transformer.moe.router_replay import RouterReplay
         RouterReplay.clear_global_replay_stats()
 
     logprobs_list = []
+    topk_logprobs_list = []
+    topk_indices_list = []
     data_iterator = iter(data_loader)
     for i in range(len(data_loader)):
         output_tensor = forward_backward_func(
-            forward_step_func=partial(logprobs_forward_step, is_correction=is_correction, packing_context=packing_context, replay_enabled=replay_enabled),
+            forward_step_func=partial(
+                logprobs_forward_step,
+                is_correction=is_correction,
+                packing_context=packing_context,
+                replay_enabled=replay_enabled,
+                topk_logprobs=topk_logprobs,
+                match_logit_moments=match_logit_moments,
+                probe_turn_metadata=probe_turn_metadata,
+                probe_generation_masks=probe_generation_masks,
+                probe_iteration=probe_iteration,
+                probe_phase=probe_phase,
+            ),
             data_iterator=data_iterator,
             model=model,
             num_microbatches=1,
@@ -1344,11 +2557,20 @@ def compute_logprobs_batch(
             collect_non_loss_data=collect_non_loss_data,
         )
         if is_pp_last_stage(pp_group):
-            logprobs_list.append(output_tensor[0].detach())
+            batch_logprobs = output_tensor[0]
+            if topk_logprobs > 0:
+                batch_topk_logprobs, batch_topk_indices = _LOGPROBS_TOPK_BUFFER[-1]
+                topk_logprobs_list.append(batch_topk_logprobs.detach())
+                topk_indices_list.append(batch_topk_indices.detach())
+            logprobs_list.append(batch_logprobs.detach())
 
     if is_pp_last_stage(pp_group):
         logprobs = torch.concat(logprobs_list, dim=0)
-        assert logprobs.dtype == dtype
+        expected_dtype = torch.float32 if match_logit_moments else dtype
+        assert logprobs.dtype == expected_dtype
+        if topk_logprobs > 0:
+            all_topk_logprobs = torch.concat(topk_logprobs_list, dim=0)
+            all_topk_indices = torch.concat(topk_indices_list, dim=0)
     else:
         logprobs = torch.empty(
             trajs_batch_size,
@@ -1356,10 +2578,30 @@ def compute_logprobs_batch(
             dtype=dtype,
             device=torch.cuda.current_device(),
         )
+        if topk_logprobs > 0:
+            all_topk_logprobs = torch.empty(
+                trajs_batch_size,
+                seq_length - 1,
+                topk_logprobs,
+                dtype=torch.float32,
+                device=torch.cuda.current_device(),
+            )
+            all_topk_indices = torch.empty(
+                trajs_batch_size,
+                seq_length - 1,
+                topk_logprobs,
+                dtype=torch.long,
+                device=torch.cuda.current_device(),
+            )
 
     # Only PP>1 needs a broadcast from the last stage; for PP=1 the output is already local.
     if get_pg_size(pp_group) > 1:
         dist.broadcast(logprobs, src=get_pp_last_rank(pp_group), group=pp_group)
+        if topk_logprobs > 0:
+            dist.broadcast(all_topk_logprobs, src=get_pp_last_rank(pp_group), group=pp_group)
+            dist.broadcast(all_topk_indices, src=get_pp_last_rank(pp_group), group=pp_group)
+    if topk_logprobs > 0:
+        return logprobs.cpu(), all_topk_logprobs.cpu(), all_topk_indices.cpu()
     return logprobs.cpu()
 
 
@@ -1627,6 +2869,48 @@ def _load_exact_routing_dump(dump_dir, routing_dump_id, require_prompt=False, ti
         if "prompt_routing_indices" in data:
             payload["prompt_routing_indices"] = data["prompt_routing_indices"].copy()
         return payload
+
+
+def _load_top_logprobs_from_npz(dump_dir, routing_dump_ids=None, timeout_s=60.0):
+    if routing_dump_ids is None:
+        return None
+
+    result = []
+    n_matched = 0
+    for dump_id in routing_dump_ids:
+        if dump_id is None:
+            result.append(None)
+            continue
+        path = _routing_dump_npz_path(dump_dir, dump_id)
+        deadline = time.time() + timeout_s
+        while not os.path.exists(path):
+            if time.time() >= deadline:
+                break
+            time.sleep(0.1)
+        if not os.path.exists(path):
+            result.append(None)
+            continue
+        with np.load(path) as data:
+            if "generated_topk_tokens" not in data or "generated_topk_logprobs" not in data:
+                result.append(None)
+                continue
+            tokens = data["generated_topk_tokens"]
+            logprobs = data["generated_topk_logprobs"]
+            rows = []
+            for token_row, logprob_row in zip(tokens, logprobs):
+                row = []
+                for token, logprob in zip(token_row.tolist(), logprob_row.tolist()):
+                    if token == "" or not np.isfinite(logprob):
+                        continue
+                    row.append({"token": str(token), "logprob": float(logprob)})
+                rows.append(row)
+            result.append(rows)
+            n_matched += 1
+    print_rank_0(
+        f"[Logprob-mismatch] matched inference top-k for {n_matched}/{len(routing_dump_ids)} "
+        f"local rollouts by routing_dump_id in {dump_dir}"
+    )
+    return result if n_matched > 0 else None
 
 
 def _load_router_diag_from_npz(dump_dir, routing_dump_ids=None, trajs=None, generation_masks=None):
@@ -2296,6 +3580,178 @@ def _wandb_log_router_metrics(diag_data, expert_data, score_data, iteration):
         print_rank_0("[Router-diag] router metrics logged")
 
 
+def _maybe_write_determinism_probe_targets(
+    *,
+    old_logprobs: torch.Tensor,
+    inference_logprobs: torch.Tensor | None,
+    generation_masks: torch.Tensor | None,
+    trajs: torch.Tensor | None,
+    turn_metadata: list[dict[str, Any]] | None,
+    iteration: int,
+    train_topk_logprobs: torch.Tensor | None = None,
+    train_topk_indices: torch.Tensor | None = None,
+) -> None:
+    """Write worst train-vs-inference logprob token keys for a later targeted probe run."""
+    args = get_args()
+    output_path = getattr(args, "rl_determinism_probe_write_targets_file", None)
+    if getattr(args, "rl_determinism_probe_targets_file", None):
+        # Targeted probe runs consume a previously discovered key set. Do not
+        # overwrite that file with the current run's targets after probe logging.
+        return
+    if not output_path or inference_logprobs is None or generation_masks is None or trajs is None:
+        return
+
+    max_targets = int(getattr(args, "rl_determinism_probe_num_targets", 64) or 0)
+    if max_targets <= 0:
+        return
+
+    old_cpu = old_logprobs.detach().float().cpu()
+    inf_cpu = inference_logprobs.detach().float().cpu()
+    masks_cpu = generation_masks.detach().cpu().bool()
+    trajs_cpu = trajs.detach().cpu()
+    target_mask = masks_cpu[:, 1:].clone()
+    target_mask &= torch.isfinite(old_cpu) & torch.isfinite(inf_cpu)
+    if not target_mask.any():
+        return
+
+    gen_offsets_by_token = masks_cpu.long().cumsum(dim=1) - 1
+    deltas = (old_cpu - inf_cpu).abs()
+    deltas = deltas.masked_fill(~target_mask, float("-inf"))
+
+    target_selection = getattr(args, "rl_determinism_probe_target_selection", "top_logprob_delta")
+    min_margin = float(getattr(args, "rl_determinism_probe_target_min_margin", 0.5))
+    tokenizer = get_tokenizer()
+
+    def _build_target(seq_index, logprob_index, score, extra=None):
+        token_index = int(logprob_index) + 1
+        metadata = (
+            turn_metadata[seq_index]
+            if turn_metadata is not None and seq_index < len(turn_metadata)
+            else {}
+        )
+        routing_dump_id = metadata.get("routing_dump_id")
+        if routing_dump_id is None:
+            return None
+        old_lp = float(old_cpu[seq_index, logprob_index].item())
+        inf_lp = float(inf_cpu[seq_index, logprob_index].item())
+        result = {
+            "iteration": int(iteration),
+            "routing_dump_id": str(routing_dump_id),
+            "target_token_index": token_index,
+            "prefix_hash": hash_token_ids(trajs_cpu[seq_index, :token_index].tolist()),
+            "gen_offset": int(gen_offsets_by_token[seq_index, token_index].item()),
+            "target_token_id": int(trajs_cpu[seq_index, token_index].item()),
+            "seq_index": int(seq_index),
+            "global_rollout_index": metadata.get("global_rollout_index"),
+            "group_index": metadata.get("group_index"),
+            "rollout_index": metadata.get("rollout_index"),
+            "turn_index": metadata.get("turn_index"),
+            "old_logprob": old_lp,
+            "inference_logprob": inf_lp,
+            "abs_logprob_delta": abs(old_lp - inf_lp),
+            "prob_abs_diff": abs(math.exp(old_lp) - math.exp(inf_lp)),
+            "target_selection_score": float(score),
+            "target_selection": target_selection,
+        }
+        if extra:
+            result.update(extra)
+        return result
+
+    k = min(max_targets, int(target_mask.sum().item()))
+    candidate_pool = k
+    if target_selection == "top1_disagreement_high_margin":
+        # Avoid scanning every generated token in Python: inspect a large pool of
+        # high logprob-delta candidates, then keep the high-margin top-1 flips.
+        candidate_pool = min(max(k * 100, 10000), int(target_mask.sum().item()))
+    top_values, top_flat_indices = torch.topk(deltas.flatten(), k=candidate_pool)
+    seq_indices = torch.div(top_flat_indices, deltas.shape[1], rounding_mode="floor")
+    logprob_indices = top_flat_indices % deltas.shape[1]
+
+    local_targets = []
+    for rank_idx in range(candidate_pool):
+        seq_index = int(seq_indices[rank_idx].item())
+        logprob_index = int(logprob_indices[rank_idx].item())
+        if target_selection == "top1_disagreement_high_margin":
+            if train_topk_logprobs is None or train_topk_indices is None:
+                continue
+            train_row_lps = train_topk_logprobs[seq_index, logprob_index].detach().float().cpu()
+            train_row_ids = train_topk_indices[seq_index, logprob_index].detach().cpu()
+            if train_row_lps.numel() < 2 or train_row_ids.numel() < 2:
+                continue
+            train_top1 = _detokenize_single_token(tokenizer, int(train_row_ids[0].item()))
+            train_top2 = _detokenize_single_token(tokenizer, int(train_row_ids[1].item()))
+            train_margin = float((train_row_lps[0] - train_row_lps[1]).item())
+            metadata = (
+                turn_metadata[seq_index]
+                if turn_metadata is not None and seq_index < len(turn_metadata)
+                else {}
+            )
+            inf_rows = metadata.get("inference_top_logprobs")
+            gen_offset = int(gen_offsets_by_token[seq_index, logprob_index + 1].item())
+            if inf_rows is None or gen_offset < 0 or gen_offset >= len(inf_rows):
+                continue
+            inf_tokens, inf_lps = _normalize_inference_top_logprobs(inf_rows[gen_offset])
+            inf_margin = _top2_margin(inf_lps)
+            if not inf_tokens or inf_margin is None:
+                continue
+            inf_top1 = inf_tokens[0]
+            if train_top1 == inf_top1:
+                continue
+            if train_margin < min_margin or float(inf_margin) < min_margin:
+                continue
+            score = min(train_margin, float(inf_margin)) * max(float(top_values[rank_idx].item()), 0.0)
+            extra = {
+                "train_top1_token": train_top1,
+                "train_top2_token": train_top2,
+                "train_top1_logprob": float(train_row_lps[0].item()),
+                "train_top2_logprob": float(train_row_lps[1].item()),
+                "train_top1_top2_margin": train_margin,
+                "inference_top1_token": inf_top1,
+                "inference_top2_token": inf_tokens[1] if len(inf_tokens) > 1 else None,
+                "inference_top1_logprob": float(inf_lps[0]) if inf_lps else None,
+                "inference_top2_logprob": float(inf_lps[1]) if len(inf_lps) > 1 else None,
+                "inference_top1_top2_margin": float(inf_margin),
+            }
+            target = _build_target(seq_index, logprob_index, score, extra)
+        else:
+            target = _build_target(seq_index, logprob_index, float(top_values[rank_idx].item()))
+        if target is not None:
+            local_targets.append(target)
+            if len(local_targets) >= max_targets:
+                break
+
+    if target_selection == "top1_disagreement_high_margin" and len(local_targets) < max_targets:
+        print_rank_0(
+            f"[RL-determinism-probe] selected {len(local_targets)}/{max_targets} "
+            f"high-margin top-1 disagreement targets from {candidate_pool} candidates"
+        )
+
+    all_targets = sorted(
+        local_targets, key=lambda item: item["target_selection_score"], reverse=True
+    )[:max_targets]
+
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if dist.is_initialized():
+        rank = dist.get_rank()
+        path = path.with_name(f"{path.stem}.rank{rank:04d}{path.suffix}")
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    payload = {
+        "iteration": int(iteration),
+        "selection": "top_abs_train_inference_logprob_delta",
+        "rank": dist.get_rank() if dist.is_initialized() else 0,
+        "num_targets": len(all_targets),
+        "targets": all_targets,
+    }
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+    os.replace(tmp_path, path)
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        print_rank_0(
+            f"[RL-determinism-probe] wrote per-rank target token shards under {path.parent}"
+        )
+
+
 def prepare_data_for_update(
     model: list[LanguageModule],
     ref_state_dict: Dict[str, Any],
@@ -2351,8 +3807,20 @@ def prepare_data_for_update(
 
         # Let's expand rollouts getting rid of the groups.
         # We need this to correctly split the rollouts across dp groups.
-        # And we do not actually need them grouped in anything below anyways.
-        rollouts = [r for g in rollouts for r in g]
+        # Keep lightweight metadata aligned to flattened rollouts for diagnostics.
+        flattened_rollouts = []
+        flattened_rollout_metadata = []
+        for group_idx, group in enumerate(rollouts):
+            for rollout_idx, rollout in enumerate(group):
+                flattened_rollouts.append(rollout)
+                flattened_rollout_metadata.append(
+                    {
+                        "group_index": group_idx,
+                        "rollout_index": rollout_idx,
+                        "global_rollout_index": len(flattened_rollouts) - 1,
+                    }
+                )
+        rollouts = flattened_rollouts
         num_turns = [nt for g in group_stats.num_turns for nt in g]
         total_turns_sampled = len(rollouts)
 
@@ -2367,6 +3835,9 @@ def prepare_data_for_update(
                 (mpu.get_data_parallel_rank() + 1) * data_split_size,
             )
             rollouts = rollouts[data_split_range[0] : data_split_range[1]]
+            flattened_rollout_metadata = flattened_rollout_metadata[
+                data_split_range[0] : data_split_range[1]
+            ]
             local_num_turns = sum(num_turns[data_split_range[0] : data_split_range[1]])
             steps_before = sum(num_turns[:data_split_range[0]])
             advantages = advantages[steps_before:steps_before+local_num_turns]
@@ -2383,12 +3854,43 @@ def prepare_data_for_update(
             ) = prepare_trajectories(
                 rollouts, tokenizer, args.seq_length, sequence_packing, args.rl_skip_bos_token
             )
+            inference_top_logprobs_by_turn = None
+            _topk_dump_dir = os.environ.get("ROUTER_STUDY_DUMP_DIR", "")
+            if _topk_dump_dir and getattr(args, "rl_logprob_mismatch_top_k", 0) > 0:
+                inference_top_logprobs_by_turn = _load_top_logprobs_from_npz(
+                    _topk_dump_dir, routing_dump_ids
+                )
+            local_turn_metadata = _build_logprob_mismatch_turn_metadata(
+                rollouts, flattened_rollout_metadata, inference_top_logprobs_by_turn
+            )
+            if probe_enabled(args):
+                runtime_state.probe_turn_metadata = local_turn_metadata
+                runtime_state.probe_generation_masks = generation_masks
+                runtime_state.probe_tokens = trajs
+                runtime_state.probe_iteration = iteration
+                if sequence_packing:
+                    print_rank_0(
+                        "[RL-determinism-probe] sequence packing is enabled; "
+                        "training-side activation probe scopes are disabled"
+                    )
+            all_turn_metadata = (
+                _gather_logprob_mismatch_turn_metadata(local_turn_metadata)
+                if sequence_packing and getattr(args, "rl_logprob_mismatch_num_examples", 0) > 0
+                else None
+            )
+            inference_logit_means, inference_logit_stds = (
+                _prepare_inference_logit_moments(rollouts, args.seq_length)
+                if getattr(args, "rl_match_train_logit_moments_to_inference", False)
+                and not sequence_packing
+                else (None, None)
+            )
 
         packing_context = None
         _replay_routing_tensor, _replay_seq_mask = None, None
         # Build trajectories based on sequence packing or standard processing
         if sequence_packing:
             with nvtx_range("sequence_packing", time=True):
+                global_turn_metadata = all_turn_metadata
                 runtime_state.packing_context = packing_context = pack_all_trajectories(
                     trajs, 
                     generation_masks, 
@@ -2442,20 +3944,32 @@ def prepare_data_for_update(
                         )
 
                 if _replay_routing_tensor is not None:
+                    dataset_tensors = [
+                        compute_trajs,
+                        compute_position_ids,
+                        _replay_routing_tensor,
+                        _replay_seq_mask,
+                    ]
+                    if inference_logit_means is not None and inference_logit_stds is not None:
+                        dataset_tensors.extend([inference_logit_means, inference_logit_stds])
+                    if probe_enabled(args):
+                        dataset_tensors.append(torch.arange(len(compute_trajs), dtype=torch.long))
                     data_loader = DataLoader(
-                        TensorDataset(compute_trajs, compute_position_ids,
-                                      _replay_routing_tensor, _replay_seq_mask),
-                        batch_size=args.micro_batch_size,
+                        TensorDataset(*dataset_tensors), batch_size=args.micro_batch_size
                     )
                 else:
+                    dataset_tensors = [
+                        compute_trajs,
+                        compute_position_ids,
+                        torch.zeros_like(compute_trajs),
+                        torch.zeros_like(compute_trajs, dtype=torch.bool),
+                    ]
+                    if inference_logit_means is not None and inference_logit_stds is not None:
+                        dataset_tensors.extend([inference_logit_means, inference_logit_stds])
+                    if probe_enabled(args):
+                        dataset_tensors.append(torch.arange(len(compute_trajs), dtype=torch.long))
                     data_loader = DataLoader(
-                        TensorDataset(
-                            compute_trajs,
-                            compute_position_ids,
-                            torch.zeros_like(compute_trajs),
-                            torch.zeros_like(compute_trajs, dtype=torch.bool),
-                        ),
-                        batch_size=args.micro_batch_size,
+                        TensorDataset(*dataset_tensors), batch_size=args.micro_batch_size
                     )
                 logprobs_batch_size = args.micro_batch_size
 
@@ -2463,7 +3977,11 @@ def prepare_data_for_update(
             # Before we can update the model, we need to get the logprobs for the \pi_{old} model.
 
             forward_backward_func = get_forward_backward_func()
-            if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
+            if (
+                args.cuda_graph_impl == "local"
+                and CudaGraphScope.full_iteration in args.cuda_graph_scope
+                and not probe_enabled(args)
+            ):
                 forward_backward_func = FullCudaGraphWrapper(
                     forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps
                 )
@@ -2489,6 +4007,11 @@ def prepare_data_for_update(
                 _routing_store, _router_score_store, _routing_handles = _register_routing_hooks(model)
 
             with torch.no_grad(), nvtx_range("compute_old_logprobs", time=True):
+                mismatch_top_k = (
+                    getattr(args, "rl_logprob_mismatch_top_k", 0)
+                    if getattr(args, "rl_logprob_mismatch_num_examples", 0) > 0
+                    else 0
+                )
                 old_logprobs = compute_logprobs_batch(
                     model=model,
                     data_loader=data_loader,
@@ -2502,7 +4025,18 @@ def prepare_data_for_update(
                     pp_group=pp_group,
                     is_correction=args.rl_inference_logprobs_is_correction,
                     replay_enabled=(_replay_routing_tensor is not None),
+                    topk_logprobs=mismatch_top_k,
+                    match_logit_moments=(
+                        inference_logit_means is not None and inference_logit_stds is not None
+                    ),
+                    probe_turn_metadata=local_turn_metadata if not sequence_packing else None,
+                    probe_generation_masks=generation_masks if not sequence_packing else None,
+                    probe_iteration=iteration,
+                    probe_phase="training_old_logprobs",
                 )
+                old_topk_logprobs, old_topk_indices = None, None
+                if mismatch_top_k > 0:
+                    old_logprobs, old_topk_logprobs, old_topk_indices = old_logprobs
                 if _replay_routing_tensor is not None:
                     _log_router_replay_correctness(iteration=iteration)
 
@@ -2580,6 +4114,7 @@ def prepare_data_for_update(
                 # Since PackingContext is a dataclass, we add these as new attributes
                 packing_context.old_logprobs = old_logprobs.cuda()
                 packing_context.ref_logprobs = ref_logprobs.cuda()
+                packed_inference_logprobs = None
 
                 if inference_logprobs is not None:
                     # Pack the inference logprobs using the helper function
@@ -2603,6 +4138,17 @@ def prepare_data_for_update(
                     packing_context.packed_inference_logprobs = packed_inference_logprobs.cuda()
                     # Only mark as having inference logprobs for IS correction if enabled
                     packing_context.has_inference_logprobs = args.rl_inference_logprobs_is_correction
+                _maybe_log_logprob_mismatch_diagnostics(
+                    old_logprobs=old_logprobs,
+                    inference_logprobs=packed_inference_logprobs,
+                    generation_masks=None,
+                    trajs=None,
+                    packing_context=packing_context,
+                    turn_metadata=global_turn_metadata,
+                    iteration=iteration,
+                    train_topk_logprobs=old_topk_logprobs,
+                    train_topk_indices=old_topk_indices,
+                )
             with nvtx_range("create_dataloader"):
                 # @vitalyk: This function also reconfigures the data loader to count the
                 # global_batch_size in the bins frame of reference.
@@ -2621,6 +4167,7 @@ def prepare_data_for_update(
                 loader = get_microbatch_dataloader(len(packing_context.packed_trajs), args.micro_batch_size)
         else:
             with nvtx_range("align_inference_logprobs", time=True):
+                aligned_inference_logprobs_for_diag = None
                 if inference_logprobs is not None:
                     inference_logprobs = align_unpacked_inference_logprobs(
                         inference_logprobs=inference_logprobs,
@@ -2628,11 +4175,42 @@ def prepare_data_for_update(
                         generation_masks=generation_masks,
                         group_stats=group_stats,
                     )
+                    aligned_inference_logprobs_for_diag = inference_logprobs
                     # We run the above to fill in the inference/train side mismatch stats.
                     # We do the above for logging purposes.
                     # Nullify logprobs if not used in IS correction,
                     if not args.rl_inference_logprobs_is_correction:
                         inference_logprobs = None
+                _maybe_log_logprob_mismatch_diagnostics(
+                    old_logprobs=old_logprobs,
+                    inference_logprobs=aligned_inference_logprobs_for_diag,
+                    generation_masks=generation_masks,
+                    trajs=trajs,
+                    packing_context=None,
+                    turn_metadata=local_turn_metadata,
+                    iteration=iteration,
+                    train_topk_logprobs=old_topk_logprobs,
+                    train_topk_indices=old_topk_indices,
+                )
+                _maybe_write_determinism_probe_targets(
+                    old_logprobs=old_logprobs,
+                    inference_logprobs=aligned_inference_logprobs_for_diag,
+                    generation_masks=generation_masks,
+                    trajs=trajs,
+                    turn_metadata=local_turn_metadata,
+                    iteration=iteration,
+                    train_topk_logprobs=old_topk_logprobs,
+                    train_topk_indices=old_topk_indices,
+                )
+                if (
+                    getattr(args, "rl_determinism_probe_write_targets_file", None)
+                    and not getattr(args, "rl_determinism_probe_dir", None)
+                    and not getattr(args, "rl_determinism_probe_targets_file", None)
+                ):
+                    print_rank_0(
+                        "[RL-determinism-probe] target discovery complete; exiting before training"
+                    )
+                    raise SystemExit(0)
             with nvtx_range("create_dataloader"):
                 # Because of multiturn, our batch sizes for non-sequence packed trajectories are not fixed anymore.
                 # As in sequence packing above, we need to reconfigure it too.
@@ -2662,6 +4240,8 @@ def prepare_data_for_update(
                 if _replay_routing_tensor is not None:
                     dataset_tensors.append(_replay_routing_tensor)
                     dataset_tensors.append(_replay_seq_mask)
+                if probe_enabled(args):
+                    dataset_tensors.append(torch.arange(len(compute_trajs), dtype=torch.long))
                 data = TensorDataset(*dataset_tensors)
                 loader = DataLoader(data, batch_size=args.micro_batch_size)
 
@@ -3006,13 +4586,28 @@ def megatron_rl_inference_mode(
 
     # Change cudagraph scope for inference (empty list = full-layer capture)
     model[0].config.cuda_graph_scope = []
-    model[0].config.cuda_graph_impl = "local"
+    if probe_enabled(args):
+        ensure_determinism_probe(model[0], args)
+        if cuda_graph_impl != "none":
+            print_rank_0(
+                "[RL-determinism-probe] disabling inference CUDA graphs so forward hooks run"
+            )
+            cuda_graph_impl = "none"
+        model[0].config.cuda_graph_impl = "none"
+    else:
+        model[0].config.cuda_graph_impl = "local"
 
     # If we get a lower precision wrapper, we go one object deeper.
     lang_module = model[0].module.module if hasattr(model[0].module, "module") else model[0].module
 
+    if probe_enabled(args):
+        # Hooks do CPU transfers and scalar reductions, which are illegal while
+        # CUDA graph capture is active. Remove existing layer graph managers too,
+        # not just the top-level config flag.
+        toggle_cuda_graphs(lang_module, "none")
+
     # Switch MoE layers to full CUDA graph capture for inference
-    if args.rl_training_cuda_graphs and args.num_experts is not None:
+    if not probe_enabled(args) and args.rl_training_cuda_graphs and args.num_experts is not None:
         transition_moe_cudagraphs(lang_module, 'full')
 
     lang_module.eval()

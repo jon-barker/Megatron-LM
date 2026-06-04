@@ -150,6 +150,8 @@ class InferenceRequest:
     generated_tokens: Optional[torch.Tensor] = None
     prompt_log_probs: Optional[torch.Tensor] = None
     generated_log_probs: Optional[torch.Tensor] = None
+    generated_logit_means: Optional[List[float]] = None
+    generated_logit_stds: Optional[List[float]] = None
     prompt_top_n_logprobs: Optional[List[Dict[str, float]]] = None
     generated_top_n_logprobs: Optional[List[Dict[str, float]]] = None
     generated_length: Optional[int] = None
@@ -481,6 +483,7 @@ class DynamicInferenceRequest(InferenceRequest):
             ("return_log_probs", torch.bool, False),  # CPU for non-selective logprobs
             ("skip_prompt_log_probs", torch.bool, False),  # CPU for non-selective logprobs
             ("top_n_logprobs", torch.int32, False),  # CPU for torch sampling
+            ("return_logit_stats", torch.bool, False),  # CPU for diagnostic logit moments
         ]
 
     def add_event(
@@ -709,6 +712,8 @@ class DynamicInferenceRequestRecord:
             generated_tokens=generated_tokens,
             generated_length=len(generated_tokens),
             generated_log_probs=merge_lists("generated_log_probs"),
+            generated_logit_means=merge_lists("generated_logit_means"),
+            generated_logit_stds=merge_lists("generated_logit_stds"),
             generated_top_n_logprobs=merge_lists("generated_top_n_logprobs"),
             sampling_params=self.requests[0].sampling_params,
             policy_epoch=policy_epoch,

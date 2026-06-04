@@ -923,6 +923,19 @@ class Attention(MegatronModule, ABC):
         """
         # Check if we need to skip RoPE
         # no_rope is 0-indexed array and self.layer_number is 1-indexed
+        try:
+            from megatron.rl.determinism_probe import probe_tensor_point
+        except ImportError:
+            probe_tensor_point = None
+
+        def _probe_attention_tensor(name: str, tensor: Tensor) -> None:
+            if probe_tensor_point is None:
+                return
+            probe_tensor_point(
+                f"decoder.layers.{self.layer_number - 1}.self_attention.{name}",
+                tensor,
+            )
+
         no_rope = (
             self.config.no_rope_freq[self.layer_number - 1] if self.config.no_rope_freq else False
         )
@@ -1007,11 +1020,15 @@ class Attention(MegatronModule, ABC):
             else:
                 query, key, value = qkv_output
             mixed_qkv = qkv_split_arg_list = None
+            _probe_attention_tensor("q_pre_rope", query)
+            _probe_attention_tensor("k_pre_rope", key)
+            _probe_attention_tensor("v_pre_attention", value)
         else:
             assert (
                 not self.config.attention_output_gate
             ), "attention_output_gate is not supported for unsplit mixed_qkv tensor."
             mixed_qkv, qkv_split_arg_list = qkv_output
+            _probe_attention_tensor("mixed_qkv_pre_rope", mixed_qkv)
         nvtx_range_pop(suffix="qkv")
 
         # ===================================================
@@ -1046,6 +1063,7 @@ class Attention(MegatronModule, ABC):
             )
             out = output.transpose(0, 1).contiguous()
             context_layer = out.view(out.size(0), out.size(1), -1)
+            _probe_attention_tensor("core_attn_out", context_layer)
             output, bias = self.linear_proj(context_layer)
             return output, bias
 
@@ -1135,6 +1153,10 @@ class Attention(MegatronModule, ABC):
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
         nvtx_range_pop(suffix="rotary_pos_emb")
 
+        _probe_attention_tensor("q_post_rope", query)
+        _probe_attention_tensor("k_post_rope", key)
+        _probe_attention_tensor("v_post_kv_adjust", value)
+
         # ==================================
         # core attention computation
         # ==================================
@@ -1202,6 +1224,8 @@ class Attention(MegatronModule, ABC):
             # note that batch is a dummy dimension in the packed case
             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
         nvtx_range_pop(suffix="core_attention")
+
+        _probe_attention_tensor("core_attn_out", core_attn_out)
 
         # Output gate
         if gate is not None:

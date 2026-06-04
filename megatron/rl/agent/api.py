@@ -64,6 +64,9 @@ class TokenRollout(AgentBaseModel):
     reward: list[float] | float
     generation_mask: list[list[bool]] | None = None
     logprobs: list[list[float]] | None = None
+    logit_means: list[list[float]] | None = None
+    logit_stds: list[list[float]] | None = None
+    top_logprobs: list[list[list[dict]] | None] | None = None
     routing_indices: list | None = None  # per-turn list of [G, L, top_k] int lists
     routing_dump_id: list[str | None] | None = None  # per-turn .npz routing dump key
     env_id: str = ''

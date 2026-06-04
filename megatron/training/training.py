@@ -935,6 +935,11 @@ def pretrain(
         run_router_study(model, args)
         return
 
+    if getattr(args, 'output_layer_sensitivity_mode', False):
+        from megatron.rl.output_layer_sensitivity import run_output_layer_sensitivity
+        run_output_layer_sensitivity(model, args)
+        return
+
     # Build a separate inference model for RL if requested.
     inference_model = None
     if args.perform_rl_step:
@@ -1025,6 +1030,13 @@ def pretrain(
                 "--rl-offload-inference-model-weights-when-idle requires a separate inference model. "
                 "This flag is only useful when doing refit since the weights are shared with the training model."
             )
+
+    if args.perform_rl_step and (
+        args.rl_prefill_rescore_rollout_dir or args.rl_prefill_rescore_rollout_file
+    ):
+        from megatron.rl import rl_utils
+        rl_utils.run_prefill_rescore_diagnostic(model, inference_model, optimizer, args)
+        return
 
     # Data stuff.
     app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()

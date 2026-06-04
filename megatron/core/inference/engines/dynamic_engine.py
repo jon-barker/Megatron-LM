@@ -886,6 +886,13 @@ class DynamicInferenceEngine(AbstractEngine):
         if request.status is None:
             request.status = Status.ACTIVE_AND_GENERATING_TOKENS
 
+        dump_topk = int(os.environ.get("ROUTER_STUDY_DUMP_TOPK", "0"))
+        if os.environ.get("ROUTER_STUDY_DUMP_DIR", "") and dump_topk > 0:
+            request.sampling_params.return_log_probs = True
+            request.sampling_params.top_n_logprobs = max(
+                int(request.sampling_params.top_n_logprobs), dump_topk
+            )
+
         assert (
             request.sampling_params.num_tokens_to_generate is None
             or request.sampling_params.num_tokens_total is None
@@ -998,10 +1005,22 @@ class DynamicInferenceEngine(AbstractEngine):
             raise Exception("specialize for <%s>." % type(prompt).__name__)
 
         routing_dump_id = None
-        if os.environ.get("ROUTER_STUDY_DUMP_DIR", ""):
+        if os.environ.get("ROUTER_STUDY_DUMP_DIR", "") or os.environ.get(
+            "RL_DETERMINISM_PROBE_DIR", ""
+        ):
             rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
             collection_id = os.environ.get("ROUTER_STUDY_COLLECTION_ID", "unknown")
             routing_dump_id = f"{collection_id}_{rank:04d}_{request_id:08d}"
+        if os.environ.get("RL_DETERMINISM_PROBE_DIR", ""):
+            try:
+                from megatron.rl.determinism_probe import register_inference_request
+                register_inference_request(
+                    request_id=request_id,
+                    routing_dump_id=routing_dump_id,
+                    prompt_tokens=tokens.cpu().tolist(),
+                )
+            except ImportError:
+                pass
 
         # Initialize request.
         request = DynamicInferenceRequest(
@@ -1026,6 +1045,8 @@ class DynamicInferenceEngine(AbstractEngine):
         sample: torch.Tensor,
         accepted_tokens: torch.Tensor,
         log_probs: torch.Tensor,
+        logit_means: Optional[List[List[float]]] = None,
+        logit_stds: Optional[List[List[float]]] = None,
         top_n_logprobs: Optional[Dict[int, List[Tuple[torch.Tensor, torch.Tensor]]]] = None,
         routing_indices_per_request: Optional[Dict[int, torch.Tensor]] = None,
         pre_fwd_active_token_count: Optional[int] = None,
@@ -1059,6 +1080,8 @@ class DynamicInferenceEngine(AbstractEngine):
             self.evicted_request_count += evict_request_ids.numel()
 
         log_probs_iter = log_probs if log_probs else repeat(None)
+        logit_means_iter = logit_means if logit_means else repeat(None)
+        logit_stds_iter = logit_stds if logit_stds else repeat(None)
         block_allocator = self.context.kv_block_allocator
 
         # Pre-compute step-level block stats (before the per-request loop)
@@ -1078,8 +1101,22 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.num_speculative_tokens > 0 and accepted_tokens is not None:
             self._spec_steps += 1
 
-        for req_idx, (request_id, tokens, accepted_tokens_list, request_log_probs) in enumerate(
-            zip(request_ids.tolist(), sample.tolist(), accepted_tokens_iter, log_probs_iter)
+        for req_idx, (
+            request_id,
+            tokens,
+            accepted_tokens_list,
+            request_log_probs,
+            request_logit_means,
+            request_logit_stds,
+        ) in enumerate(
+            zip(
+                request_ids.tolist(),
+                sample.tolist(),
+                accepted_tokens_iter,
+                log_probs_iter,
+                logit_means_iter,
+                logit_stds_iter,
+            )
         ):
 
             # Ensure tokens is always a list for consistent handling
@@ -1114,6 +1151,17 @@ class DynamicInferenceEngine(AbstractEngine):
                 if request_id not in self.stop_word_being_finished_ids:
                     is_first_token = len(request.generated_tokens) == 0
                     request.generated_tokens += tokens
+                    if os.environ.get("RL_DETERMINISM_PROBE_DIR", ""):
+                        try:
+                            from megatron.rl.determinism_probe import (
+                                update_inference_request_generated_tokens,
+                            )
+                            update_inference_request_generated_tokens(
+                                request_id=request_id,
+                                generated_tokens=request.generated_tokens,
+                            )
+                        except ImportError:
+                            pass
                     first_token_event = None
                     if self.track_generated_token_events:
                         for token in tokens:
@@ -1197,6 +1245,10 @@ class DynamicInferenceEngine(AbstractEngine):
             if num_stop_word_trim > 0:
                 if request_log_probs is not None:
                     request_log_probs = request_log_probs[:-num_stop_word_trim]
+                if request_logit_means is not None:
+                    request_logit_means = request_logit_means[:-num_stop_word_trim]
+                if request_logit_stds is not None:
+                    request_logit_stds = request_logit_stds[:-num_stop_word_trim]
                 if top_n_logprobs is not None and req_idx in top_n_logprobs:
                     top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:-num_stop_word_trim]
 
@@ -1232,6 +1284,34 @@ class DynamicInferenceEngine(AbstractEngine):
                         request.prompt_log_probs.extend(request_log_probs[:split_idx])
                     if split_idx < len(request_log_probs):
                         request.generated_log_probs.extend(request_log_probs[split_idx:])
+
+            if request_logit_means is not None and request_logit_stds is not None:
+                if request.generated_logit_means is None:
+                    request.generated_logit_means = []
+                if request.generated_logit_stds is None:
+                    request.generated_logit_stds = []
+
+                is_chunked_prefill = request_id == self.context.chunked_prefill_request_id
+                is_prefill = len(request.generated_logit_means) == 0
+                if request.sampling_params.skip_prompt_log_probs:
+                    if is_chunked_prefill:
+                        pass
+                    elif is_prefill:
+                        request.generated_logit_means.append(request_logit_means[-1])
+                        request.generated_logit_stds.append(request_logit_stds[-1])
+                    else:
+                        request.generated_logit_means.extend(request_logit_means)
+                        request.generated_logit_stds.extend(request_logit_stds)
+                else:
+                    prompt_length = len(request.prompt_tokens)
+                    total_accumulated = len(request.prompt_log_probs or []) + len(
+                        request.generated_logit_means
+                    )
+                    remaining_prompt_slots = max(0, prompt_length - 1 - total_accumulated)
+                    split_idx = min(remaining_prompt_slots, len(request_logit_means))
+                    if split_idx < len(request_logit_means):
+                        request.generated_logit_means.extend(request_logit_means[split_idx:])
+                        request.generated_logit_stds.extend(request_logit_stds[split_idx:])
 
             # Process top_n_logprobs if available (unified for both regular and chunked prefill)
             if top_n_logprobs is not None and req_idx in top_n_logprobs:
@@ -1703,6 +1783,8 @@ class DynamicInferenceEngine(AbstractEngine):
             sample = step_result["sample"]
             accepted_tokens = step_result["accepted_tokens"]
             log_probs = step_result["log_probs"]
+            logit_means = step_result.get("logit_means", None)
+            logit_stds = step_result.get("logit_stds", None)
             top_n_logprobs = step_result.get("top_n_logprobs", None)
             routing_indices_per_request = step_result.get("routing_indices_per_request", None)
             cuda_graph_request_count = step_result["cuda_graph_request_count"]
@@ -1721,6 +1803,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 sample,
                 accepted_tokens,
                 log_probs,
+                logit_means,
+                logit_stds,
                 top_n_logprobs,
                 routing_indices_per_request,
                 pre_fwd_active_token_count=context_state.get("active_token_count"),
@@ -1781,6 +1865,19 @@ class DynamicInferenceEngine(AbstractEngine):
                     if not isinstance(_lp, torch.Tensor):
                         _lp = torch.tensor(_lp, dtype=torch.float32)
                     _save["generated_log_probs"] = _lp.cpu().numpy().astype(_np.float32)
+                if _merged.generated_top_n_logprobs is not None:
+                    _rows = _merged.generated_top_n_logprobs
+                    _s_gen = len(_merged.generated_tokens)
+                    _k = max((len(row) for row in _rows), default=0)
+                    if _s_gen > 0 and _k > 0:
+                        _tokens = _np.full((_s_gen, _k), "", dtype="<U256")
+                        _logprobs = _np.full((_s_gen, _k), _np.nan, dtype=_np.float32)
+                        for _row_idx, _row in enumerate(_rows[:_s_gen]):
+                            for _col_idx, (_tok, _lp_val) in enumerate(list(_row.items())[:_k]):
+                                _tokens[_row_idx, _col_idx] = str(_tok)
+                                _logprobs[_row_idx, _col_idx] = float(_lp_val)
+                        _save["generated_topk_tokens"] = _tokens
+                        _save["generated_topk_logprobs"] = _logprobs
                 if _merged.routing_indices is not None:
                     _s_gen = len(_merged.generated_tokens)
                     _save["routing_indices"] = (

@@ -5,7 +5,9 @@ import concurrent
 import copy
 import functools
 import inspect
+import os
 from collections import defaultdict
+from contextlib import nullcontext
 from typing import Any, Dict, List, Optional, OrderedDict, Tuple, Union
 
 import torch
@@ -1194,7 +1196,7 @@ class TextGenerationController:
 
             self._sampled_tokens_cuda[sampled_indices] = sampled_tokens
 
-    def _dynamic_step_log_probs_bookkeeping(self) -> Tuple[bool, bool]:
+    def _dynamic_step_log_probs_bookkeeping(self) -> Tuple[bool, bool, bool]:
         """Perform bookkeeping necessary to compute log probs for dynamic batching.
 
         Returns:
@@ -1203,10 +1205,12 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         active_request_slice = slice(context.paused_request_count, context.total_request_count)
 
-        return_log_probs = self._request_metadata["return_log_probs"][active_request_slice]
+        request_return_log_probs = self._request_metadata["return_log_probs"][active_request_slice]
         top_n_log_probs = self._request_metadata["top_n_logprobs"][active_request_slice] > 0
+        return_logit_stats = self._request_metadata["return_logit_stats"][active_request_slice]
+        return_log_probs = request_return_log_probs | return_logit_stats
 
-        return return_log_probs.any(), top_n_log_probs.any()
+        return return_log_probs.any(), top_n_log_probs.any(), return_logit_stats.any()
 
     def _router_record_bookkeeping(self) -> Optional[Dict[int, Tensor]]:
         """Collect and map routing indices per request for MoE router recording.
@@ -1286,7 +1290,9 @@ class TextGenerationController:
 
         return routing_indices_per_request
 
-    def _dynamic_step_calculate_log_probs(self, logits: Tensor) -> Optional[Tensor]:
+    def _dynamic_step_calculate_log_probs(
+        self, logits: Tensor, return_logit_stats: bool = False
+    ) -> Optional[Tensor]:
         """Calculate log probs from logits."""
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
@@ -1295,11 +1301,12 @@ class TextGenerationController:
             logits,
             self._sampled_tokens_cuda[:active_request_count],
             only_last_token_logits=context.config.materialize_only_last_token_logits,
+            return_logit_stats=return_logit_stats,
         )
 
     def _dynamic_step_calculate_log_probs_speculative(
-        self, logits: Tensor
-    ) -> Tuple[List[List[float]], Tensor]:
+        self, logits: Tensor, return_logit_stats: bool = False
+    ) -> Tuple[List[List[float]], Tensor, List[List[float]], List[List[float]]]:
         """Calculate log probs from logits for speculative decoding.
 
         For decode requests, computes log probs for each accepted speculative token
@@ -1334,8 +1341,15 @@ class TextGenerationController:
 
         logits_squeezed = logits.squeeze(0).float()
         log_probs_tensor = F.log_softmax(logits_squeezed[: context.active_token_count], dim=-1)
+        if return_logit_stats:
+            logit_means = logits_squeezed[: context.active_token_count].mean(dim=-1)
+            logit_stds = logits_squeezed[: context.active_token_count].std(dim=-1, unbiased=False)
+        else:
+            logit_means = logit_stds = None
 
         log_probs_list_decode = []
+        logit_means_list_decode = []
+        logit_stds_list_decode = []
 
         if num_decode_requests > 0:
             decode_len = num_decode_requests * (self.num_speculative_tokens + 1)
@@ -1368,11 +1382,32 @@ class TextGenerationController:
                 gathered_log_probs[i, : accepted_counts[i].item() + 1].tolist()
                 for i in range(num_decode_requests)
             ]
+            if return_logit_stats:
+                decode_len = num_decode_requests * (self.num_speculative_tokens + 1)
+                decode_logit_means = logit_means[:decode_len].reshape(
+                    num_decode_requests, self.num_speculative_tokens + 1
+                )
+                decode_logit_stds = logit_stds[:decode_len].reshape(
+                    num_decode_requests, self.num_speculative_tokens + 1
+                )
+                logit_means_list_decode = [
+                    decode_logit_means[i, : accepted_counts[i].item() + 1].tolist()
+                    for i in range(num_decode_requests)
+                ]
+                logit_stds_list_decode = [
+                    decode_logit_stds[i, : accepted_counts[i].item() + 1].tolist()
+                    for i in range(num_decode_requests)
+                ]
 
         log_probs_list_prefill = []
+        logit_means_list_prefill = []
+        logit_stds_list_prefill = []
         if num_prefill_requests > 0:
             decode_len = num_decode_requests * (self.num_speculative_tokens + 1)
             prefill_log_probs = log_probs_tensor[decode_len:]
+            if return_logit_stats:
+                prefill_logit_means = logit_means[decode_len:]
+                prefill_logit_stds = logit_stds[decode_len:]
 
             prefill_token_ids = context.token_to_input_ids[
                 decode_len : context.active_token_count
@@ -1390,10 +1425,23 @@ class TextGenerationController:
                 prefill_query_lengths.tolist(), dim=0
             )
             log_probs_list_prefill = [lp.tolist() for lp in prefill_log_probs_split]
+            if return_logit_stats:
+                logit_means_list_prefill = [
+                    values.tolist() for values in prefill_logit_means.cpu().split(
+                        prefill_query_lengths.tolist(), dim=0
+                    )
+                ]
+                logit_stds_list_prefill = [
+                    values.tolist() for values in prefill_logit_stds.cpu().split(
+                        prefill_query_lengths.tolist(), dim=0
+                    )
+                ]
 
         log_probs_list = log_probs_list_decode + log_probs_list_prefill
+        logit_means_list = logit_means_list_decode + logit_means_list_prefill
+        logit_stds_list = logit_stds_list_decode + logit_stds_list_prefill
 
-        return log_probs_list, log_probs_tensor
+        return log_probs_list, log_probs_tensor, logit_means_list, logit_stds_list
 
     def _dynamic_step_calculate_top_n_logprobs_speculative(
         self, log_probs_tensor: Tensor
@@ -1789,9 +1837,46 @@ class TextGenerationController:
         if config.moe_enable_routing_replay:
             RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
 
+        probe_context = nullcontext()
+        probe = None
+        token_metadata = None
+        collection_id = os.environ.get("ROUTER_STUDY_COLLECTION_ID", "unknown")
+        probe_scope_fn = None
+        try:
+            from megatron.rl.determinism_probe import (
+                build_inference_token_metadata,
+                get_determinism_probe,
+                probe_scope,
+            )
+            probe_scope_fn = probe_scope
+
+            probe = get_determinism_probe(self.inference_wrapped_model.model)
+            if probe is not None and "inference" in probe.config.phases:
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                token_metadata = build_inference_token_metadata(
+                    context=context,
+                    collection_id=collection_id,
+                    rank=rank,
+                )
+                probe_context = probe_scope(
+                    phase="inference",
+                    iteration=int(collection_id) if collection_id.isdigit() else 0,
+                    token_metadata=token_metadata,
+                    batch_size=1,
+                    seq_length=len(token_metadata),
+                    extra={
+                        "active_token_count": int(context.active_token_count),
+                        "padded_active_token_count": int(context.padded_active_token_count),
+                    },
+                    probe=probe,
+                )
+        except ImportError:
+            probe_context = nullcontext()
+
         # Forward pass produces only base logits. When speculative decoding is
         # active, MTP logits are computed serially after verification.
-        logits = self._dynamic_step_forward_logits(input_ids, position_ids)
+        with probe_context:
+            logits = self._dynamic_step_forward_logits(input_ids, position_ids)
 
         # Commit Mamba intermediate states before update_requests, which
         # may swap request indices. The Python lists tracking EOS block IDs
@@ -1811,7 +1896,9 @@ class TextGenerationController:
         # Todo [Siddharth]: Can we condition the sleep on a cuda event?
         # NOTE [TDE]: This will be moved once CPU and GPU methods are separated.
         await asyncio.sleep(0)
-        return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
+        return_log_probs, return_top_n_logprobs, return_logit_stats = (
+            self._dynamic_step_log_probs_bookkeeping()
+        )
 
         self._dynamic_step_sample_bookkeeping()
 
@@ -1832,22 +1919,46 @@ class TextGenerationController:
             self._dynamic_step_sample_logits(logits)
 
         log_probs = None
+        logit_means = None
+        logit_stds = None
         top_n_logprobs = None
-        if return_log_probs or return_top_n_logprobs:
-            if self.num_speculative_tokens > 0:
-                log_probs, log_probs_tensor = self._dynamic_step_calculate_log_probs_speculative(
-                    logits
-                )
-                if return_top_n_logprobs:
-                    top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs_speculative(
-                        log_probs_tensor
+        logprob_probe_context = nullcontext()
+        if probe is not None and token_metadata is not None and probe_scope_fn is not None:
+            logprob_probe_context = probe_scope_fn(
+                phase="inference",
+                iteration=int(collection_id) if collection_id.isdigit() else 0,
+                token_metadata=token_metadata,
+                batch_size=1,
+                seq_length=len(token_metadata),
+                extra={
+                    "active_token_count": int(context.active_token_count),
+                    "padded_active_token_count": int(context.padded_active_token_count),
+                    "probe_stage": "logprobs",
+                },
+                probe=probe,
+            )
+        with logprob_probe_context:
+            if return_log_probs or return_top_n_logprobs or return_logit_stats:
+                if self.num_speculative_tokens > 0:
+                    log_probs, log_probs_tensor, logit_means, logit_stds = (
+                        self._dynamic_step_calculate_log_probs_speculative(
+                            logits, return_logit_stats=return_logit_stats
+                        )
                     )
-            else:
-                log_probs, log_probs_tensor = self._dynamic_step_calculate_log_probs(logits)
-                if return_top_n_logprobs:
-                    top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs(
-                        logits, log_probs_tensor
+                    if return_top_n_logprobs:
+                        top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs_speculative(
+                            log_probs_tensor
+                        )
+                else:
+                    log_probs, log_probs_tensor, logit_means, logit_stds = (
+                        self._dynamic_step_calculate_log_probs(
+                            logits, return_logit_stats=return_logit_stats
+                        )
                     )
+                    if return_top_n_logprobs:
+                        top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs(
+                            logits, log_probs_tensor
+                        )
 
         if skip_bookkeeping:
             request_bookkeeping = {}
@@ -1864,6 +1975,8 @@ class TextGenerationController:
                 else None
             ),
             "log_probs": log_probs,
+            "logit_means": logit_means,
+            "logit_stds": logit_stds,
             "top_n_logprobs": top_n_logprobs,
             "routing_indices_per_request": routing_indices_per_request,
             "cuda_graph_request_count": cuda_graph_request_count,

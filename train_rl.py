@@ -21,6 +21,12 @@ from megatron.rl.rl_utils import (
     get_rl_runtime_state,
     load_packed_data_by_index,
 )
+from megatron.rl.determinism_probe import (
+    build_training_token_metadata,
+    ensure_determinism_probe,
+    probe_enabled,
+    probe_scope,
+)
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
 from megatron.training.utils import is_hybrid_model
 from megatron.training.arguments import core_transformer_config_from_args
@@ -216,6 +222,10 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
 
     _replay_this_batch = False
     routing_tensor, replay_seq_mask = None, None
+    probe_seq_indices = None
+    if not args.rl_use_sequence_packing and probe_enabled(args) and len(batch_data) in (8, 10):
+        probe_seq_indices = batch_data[-1]
+        batch_data = batch_data[:-1]
 
     if args.rl_use_sequence_packing:
         # Get bin index from data iterator
@@ -323,10 +333,33 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
             RouterReplay.set_replay_data(_layer_tensors, _replay_mask)
             RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
 
-        logprobs_or_hidden_states = get_logprobs(
-            model_to_use, tokens, position_ids, no_grad=False,
-            packed_seq_params=packed_seq_params
-        )
+        probe_context = nullcontext()
+        if probe_enabled(args) and probe_seq_indices is not None:
+            probe = ensure_determinism_probe(model_to_use, args)
+            if probe is not None and "training_update" in probe.config.phases:
+                token_metadata = build_training_token_metadata(
+                    tokens=tokens,
+                    generation_masks=getattr(runtime_state, "probe_generation_masks", None),
+                    seq_indices=probe_seq_indices,
+                    turn_metadata=getattr(runtime_state, "probe_turn_metadata", None),
+                    iteration=getattr(runtime_state, "probe_iteration", args.curr_iteration),
+                    phase="training_update",
+                )
+                probe_context = probe_scope(
+                    phase="training_update",
+                    iteration=getattr(runtime_state, "probe_iteration", args.curr_iteration),
+                    token_metadata=token_metadata,
+                    batch_size=int(tokens.shape[0]),
+                    seq_length=int(tokens.shape[1]),
+                    extra={"seq_indices": probe_seq_indices.detach().cpu().tolist()},
+                    probe=probe,
+                )
+
+        with probe_context:
+            logprobs_or_hidden_states = get_logprobs(
+                model_to_use, tokens, position_ids, no_grad=False,
+                packed_seq_params=packed_seq_params
+            )
 
         if _replay_this_batch:
             RouterReplay.clear_global_router_replay_action()
@@ -468,6 +501,81 @@ if __name__ == "__main__":
             type=int,
             default=1,
             help='Maximum number of real prompt batches to use for router-study gradient cosine.',
+        )
+        group.add_argument(
+            '--output-layer-sensitivity-mode',
+            action='store_true',
+            default=False,
+            help='Load the model and run synthetic hidden-state perturbations through the LM head.',
+        )
+        group.add_argument(
+            '--output-layer-sensitivity-results-file',
+            type=str,
+            default='results/output_layer_sensitivity.json',
+            help='JSON output path for --output-layer-sensitivity-mode.',
+        )
+        group.add_argument(
+            '--output-layer-sensitivity-num-samples',
+            type=int,
+            default=256,
+            help='Number of synthetic hidden states per perturbation setting.',
+        )
+        group.add_argument(
+            '--output-layer-sensitivity-relative-l2',
+            type=str,
+            default='0.005,0.01,0.015,0.02',
+            help='Comma-separated relative-L2 perturbation magnitudes to test.',
+        )
+        group.add_argument(
+            '--output-layer-sensitivity-modes',
+            type=str,
+            default='random_isotropic,token_aligned,top_weight_norm_aligned',
+            help='Comma-separated perturbation modes.',
+        )
+        group.add_argument(
+            '--output-layer-sensitivity-hidden-rms',
+            type=float,
+            default=1.0,
+            help='RMS scale for synthetic hidden-state vectors.',
+        )
+        group.add_argument(
+            '--output-layer-sensitivity-probe-dir',
+            type=str,
+            default=None,
+            help='Optional determinism probe directory. When set, analyze observed lm_final_hidden '
+                 'deltas against the loaded output layer.',
+        )
+        group.add_argument(
+            '--output-layer-sensitivity-inference-phase',
+            type=str,
+            default='inference',
+            help='Probe phase name for inference records in --output-layer-sensitivity-probe-dir.',
+        )
+        group.add_argument(
+            '--output-layer-sensitivity-training-phase',
+            type=str,
+            default='training_old_logprobs',
+            help='Probe phase name for training records in --output-layer-sensitivity-probe-dir.',
+        )
+        group.add_argument(
+            '--output-layer-sensitivity-svd-components',
+            type=int,
+            default=0,
+            help='When analyzing an observed probe dir, compute this many top right singular '
+                 'directions of the output-layer weight and correlate hidden-delta alignment '
+                 'with selected-logit/logprob error. Set 0 to disable.',
+        )
+        group.add_argument(
+            '--output-layer-sensitivity-svd-chunk-size',
+            type=int,
+            default=8192,
+            help='Vocabulary chunk size for forming W^T W in --output-layer-sensitivity-svd-components.',
+        )
+        group.add_argument(
+            '--output-layer-sensitivity-seed',
+            type=int,
+            default=None,
+            help='Random seed for output-layer sensitivity simulation. Defaults to --seed.',
         )
         return parser
 

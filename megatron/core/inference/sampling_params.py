@@ -28,6 +28,7 @@ class SamplingParams:
     num_tokens_total: Optional[int] = None  # Cannot set both this and num_tokens_to_generate
     termination_id: Optional[int] = None
     top_n_logprobs: int = 0
+    return_logit_stats: bool = False
     return_prompt_top_n_logprobs: bool = False  # Deprecated field for backwards compatibility
     add_BOS: bool = False
     stop_words: Optional[List[str]] = (

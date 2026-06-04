@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import itertools
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -31,6 +32,7 @@ from megatron.core.transformer.cuda_graphs import (
 from megatron.core.transformer.module import Float16Module
 from megatron.rl import rl_utils
 from megatron.rl.agent.api import TokenRollout
+from megatron.rl.inference.megatron import MegatronLocal
 from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
@@ -521,6 +523,324 @@ class TestRLUtils:
             [torch.zeros(2), torch.zeros(3), torch.zeros(4)], 5
         )
         assert padded.shape == (3, 5)
+
+    def test_logprob_mismatch_candidate_boundary_and_full_generation(self):
+        old_logprobs = torch.tensor([0.0, -0.2, -0.4, -0.6, -0.8])
+        inference_logprobs = torch.tensor([0.0, -0.3, -0.1, -0.9, -0.8])
+        generation_mask = torch.tensor([False, False, True, True, True, False])
+        tokens = torch.tensor([10, 11, 12, 13, 14, 42])
+
+        candidate = rl_utils._build_logprob_mismatch_candidate(
+            old_logprobs=old_logprobs,
+            inference_logprobs=inference_logprobs,
+            generation_mask=generation_mask,
+            tokens=tokens,
+            seq_index=7,
+            metadata={"env_id": "env", "turn_index": 2},
+            max_tokens=0,
+        )
+
+        assert candidate["first_generated_token_index"] == 2
+        assert candidate["decode_start_token_index"] == 3
+        assert candidate["token_index"] == [2, 3, 4]
+        assert candidate["gen_offset"] == [0, 1, 2]
+        assert candidate["phase"] == ["prefill", "decode", "decode"]
+        assert candidate["token_id"] == [12, 13, 14]
+        torch.testing.assert_close(
+            torch.tensor(candidate["logprob_delta"]),
+            torch.tensor([0.1, -0.3, 0.3]),
+        )
+
+    def test_match_logits_to_inference_moments(self):
+        logits = torch.tensor([[[1.0, 2.0, 3.0], [10.0, 11.0, 12.0]]])
+        target_means = torch.tensor([[5.0, float("nan")]])
+        target_stds = torch.tensor([[2.0, float("nan")]])
+
+        matched = rl_utils.match_logits_to_inference_moments(
+            logits, target_means, target_stds
+        )
+
+        torch.testing.assert_close(matched[0, 0].mean(), torch.tensor(5.0))
+        torch.testing.assert_close(matched[0, 0].std(unbiased=False), torch.tensor(2.0))
+        torch.testing.assert_close(matched[0, 1], logits[0, 1])
+
+    def test_logprob_mismatch_candidate_respects_positive_token_cap(self):
+        old_logprobs = torch.tensor([0.0, -0.2, -0.4, -0.6, -0.8])
+        inference_logprobs = torch.tensor([0.0, -0.3, -0.1, -0.9, -0.8])
+        generation_mask = torch.tensor([False, False, True, True, True, False])
+        tokens = torch.tensor([10, 11, 12, 13, 14, 42])
+
+        candidate = rl_utils._build_logprob_mismatch_candidate(
+            old_logprobs=old_logprobs,
+            inference_logprobs=inference_logprobs,
+            generation_mask=generation_mask,
+            tokens=tokens,
+            seq_index=0,
+            metadata=None,
+            max_tokens=2,
+        )
+
+        assert candidate["token_index"] == [2, 3]
+        assert candidate["num_tokens"] == 2
+
+    def test_logprob_mismatch_candidate_topk_enrichment(self):
+        old_logprobs = torch.tensor([-0.1, -0.2])
+        inference_logprobs = torch.tensor([-0.1, -2.0])
+        generation_mask = torch.tensor([False, True, True])
+        tokens = torch.tensor([99, 1, 4])
+        train_topk_logprobs = torch.tensor(
+            [
+                [-0.1, -1.0, -2.0],
+                [-0.2, -0.3, -3.0],
+            ]
+        )
+        train_topk_indices = torch.tensor(
+            [
+                [1, 2, 3],
+                [4, 5, 6],
+            ]
+        )
+        metadata = {
+            "inference_top_logprobs": [
+                [{"token": "1", "logprob": -0.1}, {"token": "2", "logprob": -1.0}],
+                [
+                    {"token": "5", "logprob": -0.1},
+                    {"token": "4", "logprob": -2.0},
+                    {"token": "7", "logprob": -2.5},
+                ],
+            ],
+        }
+
+        candidate = rl_utils._build_logprob_mismatch_candidate(
+            old_logprobs=old_logprobs,
+            inference_logprobs=inference_logprobs,
+            generation_mask=generation_mask,
+            tokens=tokens,
+            seq_index=0,
+            metadata=metadata,
+            max_tokens=0,
+            train_topk_logprobs=train_topk_logprobs,
+            train_topk_indices=train_topk_indices,
+            topk_positions=1,
+            tokenizer=MockTokenizer(),
+        )
+
+        assert candidate["train_topk_tokens"][0] is None
+        assert candidate["train_topk_tokens"][1] == ["4", "5", "6"]
+        assert candidate["train_topk_available"][1]
+        assert candidate["train_top1_token"][1] == "4"
+        assert candidate["train_top2_token"][1] == "5"
+        assert candidate["train_top2_margin"][1] == pytest.approx(0.1)
+        assert candidate["inference_topk_tokens"][1] == ["5", "4", "7"]
+        assert candidate["inference_topk_available"][1]
+        assert candidate["inference_top1_token"][1] == "5"
+        assert candidate["inference_top2_token"][1] == "4"
+        assert candidate["inference_top2_margin"][1] == pytest.approx(1.9)
+        assert candidate["topk_token_overlap"][1] == 2
+        assert candidate["topk_token_overlap_frac"][1] == pytest.approx(2 / 3)
+        assert candidate["sampled_token_train_rank"][1] == 1
+        assert candidate["sampled_token_inference_rank"][1] == 2
+
+    def test_logprob_mismatch_candidate_inference_topk_fallback(self):
+        old_logprobs = torch.tensor([-0.1])
+        inference_logprobs = torch.tensor([-0.7])
+        generation_mask = torch.tensor([False, True])
+        tokens = torch.tensor([99, 4])
+        train_topk_logprobs = torch.tensor([[-0.2, -0.3]])
+        train_topk_indices = torch.tensor([[4, 5]])
+
+        candidate = rl_utils._build_logprob_mismatch_candidate(
+            old_logprobs=old_logprobs,
+            inference_logprobs=inference_logprobs,
+            generation_mask=generation_mask,
+            tokens=tokens,
+            seq_index=0,
+            metadata={},
+            max_tokens=0,
+            train_topk_logprobs=train_topk_logprobs,
+            train_topk_indices=train_topk_indices,
+            topk_positions=1,
+            tokenizer=MockTokenizer(),
+        )
+
+        assert not candidate["inference_topk_available"][0]
+        assert candidate["inference_top1_token"][0] == "4"
+        assert candidate["inference_top1_logprob"][0] == pytest.approx(-0.7)
+        assert candidate["sampled_token_inference_rank"][0] == 1
+
+    def test_extract_top_logprobs_from_dict_content(self):
+        choice = SimpleNamespace(
+            logprobs={
+                "content": [
+                    {
+                        "top_logprobs": [
+                            {"token": "1", "logprob": -0.1},
+                            {"token": "2", "logprob": -1.2},
+                        ]
+                    },
+                    {
+                        "top_logprobs": [
+                            {"token": "3", "logprob": -0.3},
+                        ]
+                    },
+                ]
+            }
+        )
+
+        top_logprobs = MegatronLocal._extract_top_logprobs(choice)
+
+        assert top_logprobs == [
+            [{"token": "1", "logprob": -0.1}, {"token": "2", "logprob": -1.2}],
+            [{"token": "3", "logprob": -0.3}],
+        ]
+
+    def test_extract_top_logprobs_from_generated_top_n_extra(self):
+        choice = SimpleNamespace(
+            generated_top_n_logprobs=[
+                {"1": -0.1, "2": -1.2},
+                {"3": -0.3},
+            ]
+        )
+
+        top_logprobs = MegatronLocal._extract_top_logprobs(choice)
+
+        assert top_logprobs == [
+            [{"token": "1", "logprob": -0.1}, {"token": "2", "logprob": -1.2}],
+            [{"token": "3", "logprob": -0.3}],
+        ]
+
+    def test_extract_unpacked_logprob_mismatch_candidates(self):
+        old_logprobs = torch.tensor(
+            [
+                [0.0, -0.2, -0.4, -0.6, -0.8],
+                [0.0, -1.0, -1.2, -1.4, -1.6],
+            ]
+        )
+        inference_logprobs = torch.tensor(
+            [
+                [0.0, -0.3, -0.1, -0.9, -0.8],
+                [0.0, -1.1, -1.1, -1.1, -1.6],
+            ]
+        )
+        generation_masks = torch.tensor(
+            [
+                [False, False, True, True, True, False],
+                [False, True, True, False, False, False],
+            ]
+        )
+        trajs = torch.tensor(
+            [
+                [10, 11, 12, 13, 14, 42],
+                [20, 21, 22, 42, 42, 42],
+            ]
+        )
+        metadata = [{"env_id": "a"}, {"env_id": "b"}]
+
+        candidates = rl_utils._extract_unpacked_logprob_mismatch_candidates(
+            old_logprobs=old_logprobs,
+            inference_logprobs=inference_logprobs,
+            generation_masks=generation_masks,
+            trajs=trajs,
+            turn_metadata=metadata,
+            max_tokens=0,
+        )
+
+        assert [candidate["env_id"] for candidate in candidates] == ["a", "b"]
+        assert candidates[0]["token_index"] == [2, 3, 4]
+        assert candidates[1]["token_index"] == [1, 2]
+
+    def test_extract_packed_logprob_mismatch_candidates(self):
+        packing_context = SimpleNamespace(
+            packing_info=SimpleNamespace(
+                bin_seq_indices=[[1, 0]],
+                seq_starts={0: [0, 4]},
+                seq_lengths=[3, 4],
+            ),
+            original_generation_masks=torch.tensor(
+                [
+                    [False, True, True, False],
+                    [False, False, True, True],
+                ]
+            ),
+            original_trajs=torch.tensor(
+                [
+                    [10, 11, 12, 42],
+                    [20, 21, 22, 23],
+                ]
+            ),
+        )
+        old_logprobs = torch.tensor([[10.0, 11.0, 12.0, 0.0, 20.0, 21.0]])
+        packed_inference_logprobs = torch.tensor([[9.0, 10.0, 13.0, 0.0, 19.0, 23.0]])
+
+        candidates = rl_utils._extract_packed_logprob_mismatch_candidates(
+            old_logprobs=old_logprobs,
+            packed_inference_logprobs=packed_inference_logprobs,
+            packing_context=packing_context,
+            turn_metadata=[{"env_id": "seq0"}, {"env_id": "seq1"}],
+            max_tokens=0,
+        )
+
+        assert [candidate["seq_index"] for candidate in candidates] == [1, 0]
+        assert candidates[0]["env_id"] == "seq1"
+        assert candidates[0]["token_index"] == [2, 3]
+        torch.testing.assert_close(
+            torch.tensor(candidates[0]["logprob_delta"]),
+            torch.tensor([1.0, -1.0]),
+        )
+        assert candidates[1]["env_id"] == "seq0"
+        assert candidates[1]["token_index"] == [1, 2]
+        torch.testing.assert_close(
+            torch.tensor(candidates[1]["logprob_delta"]),
+            torch.tensor([1.0, -2.0]),
+        )
+
+    def test_select_logprob_mismatch_candidates(self):
+        candidates = [
+            {"seq_index": 0, "rank": 0, "max_abs_logprob_delta": 0.1, "max_prob_abs_diff": 0.9},
+            {"seq_index": 1, "rank": 0, "max_abs_logprob_delta": 2.0, "max_prob_abs_diff": 0.2},
+            {"seq_index": 2, "rank": 0, "max_abs_logprob_delta": 1.0, "max_prob_abs_diff": 0.8},
+        ]
+
+        selected_by_delta = rl_utils._select_logprob_mismatch_candidates(
+            candidates, num_examples=2, selection="top_abs_delta"
+        )
+        selected_by_prob = rl_utils._select_logprob_mismatch_candidates(
+            candidates, num_examples=2, selection="top_prob_abs_diff"
+        )
+        selected_first = rl_utils._select_logprob_mismatch_candidates(
+            candidates, num_examples=2, selection="first"
+        )
+
+        assert [candidate["seq_index"] for candidate in selected_by_delta] == [1, 2]
+        assert [candidate["seq_index"] for candidate in selected_by_prob] == [0, 2]
+        assert [candidate["seq_index"] for candidate in selected_first] == [0, 1]
+
+    def test_select_logprob_mismatch_candidates_per_group(self):
+        candidates = [
+            {"seq_index": 0, "rank": 0, "group_index": 0, "max_abs_logprob_delta": 9.0, "max_prob_abs_diff": 0.9},
+            {"seq_index": 1, "rank": 0, "group_index": 0, "max_abs_logprob_delta": 8.0, "max_prob_abs_diff": 0.8},
+            {"seq_index": 2, "rank": 0, "group_index": 1, "max_abs_logprob_delta": 7.0, "max_prob_abs_diff": 0.7},
+            {"seq_index": 3, "rank": 0, "group_index": 2, "max_abs_logprob_delta": 6.0, "max_prob_abs_diff": 0.6},
+        ]
+
+        selected = rl_utils._select_logprob_mismatch_candidates(
+            candidates, num_examples=3, selection="top_abs_delta_per_group"
+        )
+
+        assert [candidate["seq_index"] for candidate in selected] == [0, 2, 3]
+
+    def test_select_logprob_mismatch_candidates_per_group_fills_remainder(self):
+        candidates = [
+            {"seq_index": 0, "rank": 0, "group_index": 0, "max_abs_logprob_delta": 9.0, "max_prob_abs_diff": 0.9},
+            {"seq_index": 1, "rank": 0, "group_index": 0, "max_abs_logprob_delta": 8.0, "max_prob_abs_diff": 0.8},
+            {"seq_index": 2, "rank": 0, "group_index": 1, "max_abs_logprob_delta": 7.0, "max_prob_abs_diff": 0.7},
+        ]
+
+        selected = rl_utils._select_logprob_mismatch_candidates(
+            candidates, num_examples=3, selection="top_abs_delta_per_group"
+        )
+
+        assert [candidate["seq_index"] for candidate in selected] == [0, 2, 1]
 
     @pytest.mark.parametrize(
         "initialize_model_parallel",

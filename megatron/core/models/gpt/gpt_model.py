@@ -655,6 +655,12 @@ class GPTModel(LanguageModule):
                 )
         sequence_parallel_override = False
 
+        try:
+            from megatron.rl.determinism_probe import probe_tensor_point
+            probe_tensor_point("lm_final_hidden", hidden_states)
+        except ImportError:
+            pass
+
         if in_inference_mode and inference_context.config.materialize_only_last_token_logits:
             if inference_context.is_static_batching():
                 hidden_states = hidden_states[-1:, :, :]
@@ -680,6 +686,11 @@ class GPTModel(LanguageModule):
 
         # Apply MuP output scaling to logits
         logits = self._scale_logits(logits)
+        try:
+            from megatron.rl.determinism_probe import probe_tensor_point
+            probe_tensor_point("lm_logits", logits)
+        except ImportError:
+            pass
 
         # Restore sequence parallel execution to the output layer if necessary.
         if sequence_parallel_override:

@@ -23,6 +23,9 @@ class InferenceResponse(BaseModel):
     token_ids: list[int] | None = None
     prompt_length: int | None = None
     logprobs: list[float] | None = None
+    logit_means: list[float] | None = None
+    logit_stds: list[float] | None = None
+    top_logprobs: list[list[dict]] | None = None
     routing_indices: list | None = None  # [G, L, top_k] int, present when --moe-enable-routing-replay
     routing_dump_id: str | None = None  # Lightweight key for loading routing tensors from .npz
     policy_epoch: list[tuple[int, int]]

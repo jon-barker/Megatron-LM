@@ -57,6 +57,9 @@ MODEL_OPTIONS="\
   --rotary-base 1000000 \
   --use-rotary-position-embeddings \
   --swiglu \
+  --rl-default-top-k -1 \
+  --rl-default-temperature 1.0 \
+  --rl-default-top-p 1.0 \
   --disable-bias-linear \
   --attention-dropout 0.0 \
   --hidden-dropout 0.0 \

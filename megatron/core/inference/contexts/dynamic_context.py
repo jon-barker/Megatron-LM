@@ -2900,8 +2900,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         }
 
     def calculate_log_probs(
-        self, logits: Tensor, new_tokens: Tensor, only_last_token_logits: Optional[bool] = False
-    ) -> Tuple[List[List[float]], Tensor]:
+        self,
+        logits: Tensor,
+        new_tokens: Tensor,
+        only_last_token_logits: Optional[bool] = False,
+        return_logit_stats: bool = False,
+    ) -> Tuple[List[List[float]], Tensor, Optional[List[List[float]]], Optional[List[List[float]]]]:
         """Calculate log probs for all active requests and return them.
 
         TODO: @wdykas support top-n log probs.
@@ -2924,7 +2928,34 @@ class DynamicInferenceContext(BaseInferenceContext):
             seq_idx = torch.arange(len(new_tokens), dtype=torch.int32, device=logits.device)
             log_probs = F.log_softmax(logits_squeezed[seq_idx], dim=-1)
             selected_log_probs = log_probs[seq_idx, new_tokens]
-            return [[lp] for lp in selected_log_probs.tolist()], log_probs
+            try:
+                from megatron.rl.determinism_probe import (
+                    active_generated_token_metadata,
+                    probe_tensor_point,
+                )
+                selected_metadata = active_generated_token_metadata()
+                probe_tensor_point(
+                    "lm_selected_logprob",
+                    selected_log_probs.unsqueeze(-1),
+                    token_metadata=(
+                        selected_metadata
+                        if len(selected_metadata) == selected_log_probs.numel()
+                        else None
+                    ),
+                )
+            except ImportError:
+                pass
+            if return_logit_stats:
+                logit_means = logits_squeezed[seq_idx].mean(dim=-1).tolist()
+                logit_stds = logits_squeezed[seq_idx].std(dim=-1, unbiased=False).tolist()
+            else:
+                logit_means = logit_stds = None
+            return (
+                [[lp] for lp in selected_log_probs.tolist()],
+                log_probs,
+                [[mean] for mean in logit_means] if logit_means is not None else None,
+                [[std] for std in logit_stds] if logit_stds is not None else None,
+            )
 
         log_probs = F.log_softmax(logits_squeezed, dim=-1)
         # Get the selected token ids for all tokens.
@@ -2962,14 +2993,45 @@ class DynamicInferenceContext(BaseInferenceContext):
         # (sequence_length x vocab_size) -> (sequence_length)
         seq_idx = torch.arange(self.active_token_count, device=log_probs.device)
         selected_log_probs = log_probs[seq_idx, active_token_ids]
+        try:
+            from megatron.rl.determinism_probe import (
+                active_nonpadding_token_metadata,
+                probe_tensor_point,
+            )
+            selected_metadata = active_nonpadding_token_metadata()
+            probe_tensor_point(
+                "lm_selected_logprob",
+                selected_log_probs.unsqueeze(-1),
+                token_metadata=(
+                    selected_metadata
+                    if len(selected_metadata) == selected_log_probs.numel()
+                    else None
+                ),
+            )
+        except ImportError:
+            pass
 
         # Split the log probs across request boundaries
         selected_log_probs_list = selected_log_probs.cpu().split(
             active_query_lengths.tolist(), dim=0
         )
+        if return_logit_stats:
+            logit_means_list = logits_squeezed[: self.active_token_count].mean(dim=-1).cpu().split(
+                active_query_lengths.tolist(), dim=0
+            )
+            logit_stds_list = logits_squeezed[: self.active_token_count].std(dim=-1, unbiased=False).cpu().split(
+                active_query_lengths.tolist(), dim=0
+            )
+        else:
+            logit_means_list = logit_stds_list = None
 
         # Convert each log prob tensor into a list
-        return [lp.tolist() for lp in selected_log_probs_list], log_probs
+        return (
+            [lp.tolist() for lp in selected_log_probs_list],
+            log_probs,
+            [means.tolist() for means in logit_means_list] if logit_means_list is not None else None,
+            [stds.tolist() for stds in logit_stds_list] if logit_stds_list is not None else None,
+        )
 
     def get_kvcache_utilization_stats(self) -> dict:
         """Compute KV cache buffer utilization stats for the current step.

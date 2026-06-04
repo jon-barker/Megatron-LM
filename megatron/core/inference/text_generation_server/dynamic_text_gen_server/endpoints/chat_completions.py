@@ -229,6 +229,9 @@ try:
         parsers = current_app.config['parsers']
 
         req = await request.get_json()
+        extra_body = req.get("extra_body", {})
+        if not isinstance(extra_body, dict):
+            extra_body = {}
         tools = req.get("tools", None)
         tools_requested = bool(tools)
         messages = req.get("messages")
@@ -342,9 +345,18 @@ try:
 
             # Check for 'logprobs' (bool) and 'top_logprobs' (int)
             return_log_probs = bool(req.get("logprobs", False))
-            top_n_logprobs = int(req.get("top_logprobs", 0)) if return_log_probs else 0
-            skip_prompt_log_probs = bool(req.get("skip_prompt_log_probs", True))
-            add_BOS = bool(req.get("add_BOS", False))
+            top_n_logprobs = (
+                int(req.get("top_logprobs", extra_body.get("top_logprobs", 0)))
+                if return_log_probs
+                else 0
+            )
+            return_logit_stats = bool(
+                req.get("return_logit_stats", extra_body.get("return_logit_stats", False))
+            )
+            skip_prompt_log_probs = bool(
+                req.get("skip_prompt_log_probs", extra_body.get("skip_prompt_log_probs", True))
+            )
+            add_BOS = bool(req.get("add_BOS", extra_body.get("add_BOS", False)))
 
             # The engine only handles add_BOS for string prompts, not pre-tokenized
             # input. Since we pre-tokenize via apply_chat_template, we must handle
@@ -367,6 +379,7 @@ try:
                 top_p=top_p,
                 return_log_probs=return_log_probs,
                 top_n_logprobs=top_n_logprobs,
+                return_logit_stats=return_logit_stats,
                 num_tokens_to_generate=(int(max_tokens) if max_tokens is not None else None),
                 skip_prompt_log_probs=skip_prompt_log_probs,
                 add_BOS=add_BOS,
@@ -432,7 +445,7 @@ try:
 
             logprobs_content = None
             if sampling_params.return_log_probs:
-                token_logprobs = result.get('log_probs', [])
+                token_logprobs = result.get('generated_log_probs', result.get('log_probs', []))
 
                 tokens_to_decode = [[tok] for tok in result["generated_tokens"]]
                 tokens = list(map(tokenizer.detokenize, tokens_to_decode))
@@ -482,6 +495,11 @@ try:
             message["prompt_token_ids"] = result["prompt_tokens"]
             message["generation_token_ids"] = result["generated_tokens"]
             message["generation_log_probs"] = result.get("generated_log_probs", [])
+            message["generation_logit_means"] = result.get("generated_logit_means", [])
+            message["generation_logit_stds"] = result.get("generated_logit_stds", [])
+            message["generated_top_n_logprobs"] = result.get("generated_top_n_logprobs", [])
+            if result.get("routing_dump_id") is not None:
+                message["routing_dump_id"] = result.get("routing_dump_id")
             return_log_probs = sampling_params.return_log_probs
 
             finish_reason = "tool_calls" if metadata.get("tool_calls", []) else "stop"
@@ -497,6 +515,9 @@ try:
                 "prompt_token_ids": result["prompt_tokens"],
                 "generation_token_ids": result["generated_tokens"],
                 "generation_log_probs": result.get("generated_log_probs", []),
+                "generation_logit_means": result.get("generated_logit_means", []),
+                "generation_logit_stds": result.get("generated_logit_stds", []),
+                "generated_top_n_logprobs": result.get("generated_top_n_logprobs", []),
                 "raw_text": result["prompt"] + result["generated_text"],
                 # 'logprobs' in chat API is an object containing 'content'
                 # "logprobs": {"content": logprobs_content} if logprobs_content else None,
