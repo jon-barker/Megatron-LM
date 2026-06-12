@@ -28,6 +28,7 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import get_attention_mask, set_decode_expert_padding
+from megatron.core.models.common.output_layer import fp32_log_softmax
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.enums import CudaGraphScope
@@ -301,6 +302,9 @@ class TextGenerationController:
         assert isinstance(top_k, int)
         assert not (top_k > 0 and top_p > 0.0), "Cannot have top-p and top-k both greater than zero"
         assert top_p <= 1.0, "top-p should be in (0,1]"
+
+        # Softmax/top-p cumsum/multinomial are unstable in bf16/fp16 over large vocabs.
+        last_token_logits = last_token_logits.float()
 
         def modify_logits_for_top_k_filtering(logits, top_k):
             """Set the logits for none top-k values to -inf."""
@@ -1340,7 +1344,7 @@ class TextGenerationController:
         num_decode_requests = active_request_count - num_prefill_requests
 
         logits_squeezed = logits.squeeze(0).float()
-        log_probs_tensor = F.log_softmax(logits_squeezed[: context.active_token_count], dim=-1)
+        log_probs_tensor = fp32_log_softmax(logits_squeezed[: context.active_token_count], dim=-1)
         if return_logit_stats:
             logit_means = logits_squeezed[: context.active_token_count].mean(dim=-1)
             logit_stds = logits_squeezed[: context.active_token_count].std(dim=-1, unbiased=False)
@@ -1850,8 +1854,14 @@ class TextGenerationController:
             )
             probe_scope_fn = probe_scope
 
+            from megatron.rl.mismatch_hidden_capture import mismatch_hidden_capture_enabled
+
             probe = get_determinism_probe(self.inference_wrapped_model.model)
-            if probe is not None and "inference" in probe.config.phases:
+            capture_hidden = mismatch_hidden_capture_enabled()
+            if (
+                capture_hidden
+                or (probe is not None and "inference" in probe.config.phases)
+            ):
                 rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
                 token_metadata = build_inference_token_metadata(
                     context=context,

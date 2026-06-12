@@ -935,6 +935,11 @@ def pretrain(
         run_router_study(model, args)
         return
 
+    if getattr(args, 'extract_output_weight_npy', None):
+        from megatron.rl.output_layer_sensitivity import extract_output_weight_npy
+        extract_output_weight_npy(model, args)
+        return
+
     if getattr(args, 'output_layer_sensitivity_mode', False):
         from megatron.rl.output_layer_sensitivity import run_output_layer_sensitivity
         run_output_layer_sensitivity(model, args)

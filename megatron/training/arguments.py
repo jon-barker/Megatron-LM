@@ -2345,8 +2345,18 @@ def _add_rl_args(parser):
     group.add_argument('--rl-logprob-mismatch-top-k', type=int, default=0,
                        help='If positive, log train/inference top-k token distributions at the largest mismatch '
                             'positions for each selected rollout.')
-    group.add_argument('--rl-logprob-mismatch-topk-positions', type=int, default=8,
-                       help='Number of largest mismatch token positions per selected rollout to enrich with top-k overlap data.')
+    group.add_argument('--rl-logprob-mismatch-topk-positions', type=int, default=0,
+                       help='Number of largest mismatch token positions per selected rollout to enrich with train-side top-k overlap data. '
+                            'Set to 0 to include every generated token.')
+    group.add_argument('--rl-logprob-mismatch-capture-hidden', action=argparse.BooleanOptionalAction, type=bool, default=True,
+                       help='When logprob mismatch W&B logging is enabled, capture per-token lm_final_hidden '
+                            'digests during inference and training old-logprob replay for the mismatch table.')
+    group.add_argument('--rl-logprob-mismatch-recompute-logits', action=argparse.BooleanOptionalAction, type=bool, default=False,
+                       help='When capturing hidden states for the logprob mismatch table, also recompute '
+                            'per-token logits from the captured train/inference hidden states through the shared '
+                            'output projection: adds delta_logit_sampled, recompute_train/inference_logprob, '
+                            'recompute_logprob_delta, and linearized_logprob_delta columns. Requires TP=1 and does '
+                            'a full-vocab matmul over selected tokens, so it is off by default.')
     group.add_argument('--rl-determinism-probe-dir', type=str, default=None,
                        help='Directory for opt-in RL determinism probe JSONL activation hashes. '
                             'Set to None to disable.')
@@ -2391,6 +2401,13 @@ def _add_rl_args(parser):
     group.add_argument('--rl-match-train-logit-moments-to-inference', action=argparse.BooleanOptionalAction, type=bool, default=False,
                        help='For RL old-logprob recompute, rescale train-side logits per token to match inference-side '
                             'logit mean/std when those stats are available.')
+    group.add_argument('--rl-match-train-logprob-path-to-inference', action=argparse.BooleanOptionalAction, type=bool, default=False,
+                       help='For RL old-logprob recompute, match inference logprob extraction: upcast logits to fp32 '
+                            'before log-softmax and use the same log_softmax+gather path as the inference engine.')
+    if '--rl-fp32-output-layer-logsoftmax' not in parser._option_string_actions:
+        group.add_argument('--rl-fp32-output-layer-logsoftmax', action=argparse.BooleanOptionalAction, type=bool, default=False,
+                           help='Experimental RL numerics mode: run GPT/Mamba output-layer matmul and downstream '
+                                'log-softmax/probability math in fp32 on both training and dynamic inference paths.')
     group.add_argument('--rl-prefill-rescore-rollout-dir', type=str, default=None,
                        help='Diagnostic mode: load rollout_*.npz files from this directory and compare original '
                             'decode logprobs with full-prefill inference prompt logprobs using the normal RL inference engine.')

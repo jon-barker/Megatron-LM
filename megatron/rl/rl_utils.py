@@ -29,6 +29,7 @@ from megatron.core import mpu
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.models.common.output_layer import fp32_selective_log_softmax
 from megatron.core.num_microbatches_calculator import reconfigure_num_microbatches_calculator
 from megatron.core.optimizer import MegatronOptimizer
 from megatron.core.pipeline_parallel import get_forward_backward_func
@@ -96,6 +97,7 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
 )
 from megatron.rl.determinism_probe import (
+    active_probe_topk,
     build_training_token_metadata,
     ensure_determinism_probe,
     get_determinism_probe,
@@ -742,21 +744,65 @@ def _build_logprob_mismatch_candidate(
     prob_ratio = torch.exp(torch.clamp(delta, min=-80.0, max=80.0))
 
     token_positions_cpu = generated_positions.cpu()
-    token_ids = tokens.detach().cpu()[token_positions_cpu].to(torch.long)
+    tokens_cpu = tokens.detach().cpu().to(torch.long)
+    token_ids = tokens_cpu[token_positions_cpu]
     gen_offsets = token_positions_cpu - first_generated
     phases = ["prefill" if int(pos.item()) == first_generated else "decode" for pos in token_positions_cpu]
+    # prefix_hash of the context that produces lm_final_hidden for each generated
+    # token; aligns with the training/inference hidden-capture keys.
+    prefix_hashes = [
+        hash_token_ids(tokens_cpu[: int(pos.item())].tolist()) for pos in token_positions_cpu
+    ]
 
     metadata = metadata or {}
-    topk_fields = _empty_topk_token_fields(int(generated_positions.numel()))
-    if (
-        topk_positions > 0
-        and train_topk_logprobs is not None
-        and train_topk_indices is not None
-    ):
-        inference_top_logprobs = metadata.get("inference_top_logprobs") or []
-        num_topk_rows = min(topk_positions, prob_abs_diff.numel())
-        topk_row_indices = torch.topk(prob_abs_diff, k=num_topk_rows).indices.tolist()
-        for row_idx in topk_row_indices:
+    num_tokens = int(generated_positions.numel())
+    topk_fields = _empty_topk_token_fields(num_tokens)
+    inference_top_logprobs = metadata.get("inference_top_logprobs") or []
+    sampled_token_strs: list[str] = []
+
+    for row_idx in range(num_tokens):
+        sampled_token_id = int(token_ids[row_idx].item())
+        sampled_token = _detokenize_single_token(tokenizer, sampled_token_id)
+        sampled_token_strs.append(sampled_token)
+        gen_offset = int(gen_offsets[row_idx].item())
+        inf_tokens, inf_lps = (
+            _normalize_inference_top_logprobs(inference_top_logprobs[gen_offset])
+            if 0 <= gen_offset < len(inference_top_logprobs)
+            else ([], [])
+        )
+        inference_topk_available = bool(
+            0 <= gen_offset < len(inference_top_logprobs)
+            and inference_top_logprobs[gen_offset]
+        )
+        if not inf_tokens:
+            inf_tokens = [sampled_token]
+            inf_lps = [float(inf_vals[row_idx].item())]
+        topk_fields["inference_topk_tokens"][row_idx] = inf_tokens
+        topk_fields["inference_topk_logprobs"][row_idx] = [float(x) for x in inf_lps]
+        topk_fields["inference_topk_available"][row_idx] = inference_topk_available
+        topk_fields["inference_top1_token"][row_idx] = inf_tokens[0] if inf_tokens else ""
+        topk_fields["inference_top1_logprob"][row_idx] = (
+            float(inf_lps[0]) if inf_lps else float("nan")
+        )
+        topk_fields["inference_top2_token"][row_idx] = (
+            inf_tokens[1] if len(inf_tokens) > 1 else ""
+        )
+        topk_fields["inference_top2_logprob"][row_idx] = (
+            float(inf_lps[1]) if len(inf_lps) > 1 else float("nan")
+        )
+        topk_fields["inference_top2_margin"][row_idx] = _top2_margin(inf_lps)
+        topk_fields["sampled_token_inference_rank"][row_idx] = _rank_in_tokens(
+            sampled_token, inf_tokens
+        )
+
+    if train_topk_logprobs is not None and train_topk_indices is not None:
+        if topk_positions > 0:
+            train_topk_row_indices = torch.topk(
+                prob_abs_diff, k=min(topk_positions, num_tokens)
+            ).indices.tolist()
+        else:
+            train_topk_row_indices = list(range(num_tokens))
+        for row_idx in train_topk_row_indices:
             logprob_pos = int(logprob_positions[row_idx].item())
             sampled_token_id = int(token_ids[row_idx].item())
             sampled_token = _detokenize_single_token(tokenizer, sampled_token_id)
@@ -764,23 +810,10 @@ def _build_logprob_mismatch_candidate(
             train_ids = train_topk_indices.detach().cpu()[logprob_pos].to(torch.long).tolist()
             train_lps = train_topk_logprobs.detach().cpu()[logprob_pos].float().tolist()
             train_tokens = [_detokenize_single_token(tokenizer, token_id) for token_id in train_ids]
-
-            gen_offset = int(gen_offsets[row_idx].item())
-            inf_tokens, inf_lps = (
-                _normalize_inference_top_logprobs(inference_top_logprobs[gen_offset])
-                if 0 <= gen_offset < len(inference_top_logprobs)
-                else ([], [])
-            )
-            if not inf_tokens:
-                # Some inference providers return only the sampled token logprob.
-                # Keep the inference top-k availability flag false, but expose the
-                # sampled token as a useful one-token proxy instead of leaving all
-                # inference-side fields blank.
-                inf_tokens = [sampled_token]
-                inf_lps = [float(inf_vals[row_idx].item())]
-
+            inf_tokens = topk_fields["inference_topk_tokens"][row_idx] or []
             overlap = len(set(train_tokens) & set(inf_tokens))
             denom = min(len(train_tokens), len(inf_tokens))
+
             topk_fields["train_topk_tokens"][row_idx] = train_tokens
             topk_fields["train_topk_logprobs"][row_idx] = [float(x) for x in train_lps]
             topk_fields["train_topk_available"][row_idx] = bool(train_tokens)
@@ -795,25 +828,6 @@ def _build_logprob_mismatch_candidate(
                 float(train_lps[1]) if len(train_lps) > 1 else float("nan")
             )
             topk_fields["train_top2_margin"][row_idx] = _top2_margin(train_lps)
-            topk_fields["inference_topk_tokens"][row_idx] = inf_tokens
-            topk_fields["inference_topk_logprobs"][row_idx] = [float(x) for x in inf_lps]
-            topk_fields["inference_topk_available"][row_idx] = bool(
-                0 <= gen_offset < len(inference_top_logprobs)
-                and inference_top_logprobs[gen_offset]
-            )
-            topk_fields["inference_top1_token"][row_idx] = (
-                inf_tokens[0] if inf_tokens else ""
-            )
-            topk_fields["inference_top1_logprob"][row_idx] = (
-                float(inf_lps[0]) if inf_lps else float("nan")
-            )
-            topk_fields["inference_top2_token"][row_idx] = (
-                inf_tokens[1] if len(inf_tokens) > 1 else ""
-            )
-            topk_fields["inference_top2_logprob"][row_idx] = (
-                float(inf_lps[1]) if len(inf_lps) > 1 else float("nan")
-            )
-            topk_fields["inference_top2_margin"][row_idx] = _top2_margin(inf_lps)
             topk_fields["topk_token_overlap"][row_idx] = overlap
             topk_fields["topk_token_overlap_frac"][row_idx] = (
                 float(overlap / denom) if denom > 0 else None
@@ -821,9 +835,8 @@ def _build_logprob_mismatch_candidate(
             topk_fields["sampled_token_train_rank"][row_idx] = _rank_in_tokens(
                 sampled_token, train_tokens
             )
-            topk_fields["sampled_token_inference_rank"][row_idx] = _rank_in_tokens(
-                sampled_token, inf_tokens
-            )
+
+    routing_dump_id = metadata.get("routing_dump_id")
 
     candidate = {
         "seq_index": int(seq_index),
@@ -853,6 +866,9 @@ def _build_logprob_mismatch_candidate(
         "mean_abs_logprob_delta": float(delta.abs().mean().item()),
         "mean_prob_abs_diff": float(prob_abs_diff.mean().item()),
         "num_tokens": int(generated_positions.numel()),
+        "routing_dump_id": routing_dump_id,
+        "prefix_hash": prefix_hashes,
+        "sampled_token_str": sampled_token_strs,
         **topk_fields,
     }
     return candidate
@@ -1182,6 +1198,54 @@ def _wandb_log_logprob_mismatch_candidates(
                         candidate["topk_token_overlap_frac"][row_idx],
                         candidate["sampled_token_train_rank"][row_idx],
                         candidate["sampled_token_inference_rank"][row_idx],
+                        candidate.get("routing_dump_id"),
+                        (candidate.get("hidden_hash_match") or [None] * candidate["num_tokens"])[
+                            row_idx
+                        ],
+                        (candidate.get("hidden_rel_l2") or [float("nan")] * candidate["num_tokens"])[
+                            row_idx
+                        ],
+                        (candidate.get("hidden_cosine") or [float("nan")] * candidate["num_tokens"])[
+                            row_idx
+                        ],
+                        (candidate.get("train_hidden_hash") or [""] * candidate["num_tokens"])[
+                            row_idx
+                        ],
+                        (
+                            candidate.get("inference_hidden_hash") or [""] * candidate["num_tokens"]
+                        )[row_idx],
+                        (
+                            candidate.get("train_hidden_norm")
+                            or [float("nan")] * candidate["num_tokens"]
+                        )[row_idx],
+                        (
+                            candidate.get("inference_hidden_norm")
+                            or [float("nan")] * candidate["num_tokens"]
+                        )[row_idx],
+                        (
+                            candidate.get("hidden_norm_ratio")
+                            or [float("nan")] * candidate["num_tokens"]
+                        )[row_idx],
+                        (
+                            candidate.get("delta_logit_sampled")
+                            or [float("nan")] * candidate["num_tokens"]
+                        )[row_idx],
+                        (
+                            candidate.get("recompute_train_logprob")
+                            or [float("nan")] * candidate["num_tokens"]
+                        )[row_idx],
+                        (
+                            candidate.get("recompute_inference_logprob")
+                            or [float("nan")] * candidate["num_tokens"]
+                        )[row_idx],
+                        (
+                            candidate.get("recompute_logprob_delta")
+                            or [float("nan")] * candidate["num_tokens"]
+                        )[row_idx],
+                        (
+                            candidate.get("linearized_logprob_delta")
+                            or [float("nan")] * candidate["num_tokens"]
+                        )[row_idx],
                     ]
                 )
 
@@ -1228,6 +1292,20 @@ def _wandb_log_logprob_mismatch_candidates(
                     "topk_token_overlap_frac",
                     "sampled_token_train_rank",
                     "sampled_token_inference_rank",
+                    "routing_dump_id",
+                    "hidden_hash_match",
+                    "hidden_rel_l2",
+                    "hidden_cosine",
+                    "train_hidden_hash",
+                    "inference_hidden_hash",
+                    "train_hidden_norm",
+                    "inference_hidden_norm",
+                    "hidden_norm_ratio",
+                    "delta_logit_sampled",
+                    "recompute_train_logprob",
+                    "recompute_inference_logprob",
+                    "recompute_logprob_delta",
+                    "linearized_logprob_delta",
                 ],
                 data=token_rows,
             ),
@@ -1263,6 +1341,7 @@ def _maybe_log_logprob_mismatch_diagnostics(
     iteration: int,
     train_topk_logprobs: torch.Tensor | None = None,
     train_topk_indices: torch.Tensor | None = None,
+    model: Any | None = None,
 ) -> None:
     args = get_args()
     num_examples = getattr(args, "rl_logprob_mismatch_num_examples", 0)
@@ -1277,7 +1356,7 @@ def _maybe_log_logprob_mismatch_diagnostics(
             if getattr(args, "rl_logprob_mismatch_top_k", 0) > 0
             else 0
         )
-        tokenizer = get_tokenizer() if topk_positions > 0 else None
+        tokenizer = get_tokenizer()
         if packing_context is None:
             local_candidates = _extract_unpacked_logprob_mismatch_candidates(
                 old_logprobs=old_logprobs,
@@ -1309,7 +1388,162 @@ def _maybe_log_logprob_mismatch_diagnostics(
         num_examples,
         getattr(args, "rl_logprob_mismatch_selection", "top_abs_delta"),
     )
+    if getattr(args, "rl_logprob_mismatch_capture_hidden", True):
+        from megatron.rl.mismatch_hidden_capture import (
+            collect_candidate_prefix_keys,
+            compute_candidate_logit_diagnostics,
+            enrich_candidate_hidden_stats,
+            enrich_candidate_inference_topk,
+            gather_inference_topk,
+            gather_selected_hidden_vectors,
+            mismatch_hidden_capture_enabled,
+        )
+
+        if mismatch_hidden_capture_enabled():
+            needed_keys = collect_candidate_prefix_keys(selected)
+            gathered_vectors = gather_selected_hidden_vectors(needed_keys)
+            gathered_inference_topk = gather_inference_topk()
+            selected = [
+                enrich_candidate_inference_topk(
+                    enrich_candidate_hidden_stats(
+                        candidate, vectors=gathered_vectors
+                    ),
+                    gathered_inference_topk,
+                )
+                for candidate in selected
+            ]
+            output_weight = (
+                _get_logit_output_weight(model)
+                if getattr(args, "rl_logprob_mismatch_recompute_logits", False)
+                else None
+            )
+            if output_weight is not None:
+                output_bias = _get_logit_output_bias(model)
+                compute_candidate_logit_diagnostics(
+                    selected, gathered_vectors, output_weight, output_bias
+                )
+            selected_tokens = sum(int(c.get("num_tokens") or 0) for c in selected)
+            selected_hidden_hits = sum(
+                int(c.get("hidden_pairs_matched") or 0) for c in selected
+            )
+            selected_topk_hits = sum(
+                sum(1 for avail in (c.get("inference_topk_available") or []) if avail)
+                for c in selected
+            )
+
+            def _flat_abs(field: str) -> list[float]:
+                vals: list[float] = []
+                for cand in selected:
+                    for x in cand.get(field) or []:
+                        if isinstance(x, (int, float)) and x == x:
+                            vals.append(abs(float(x)))
+                return vals
+
+            def _flat_abs_diff(field_a: str, field_b: str) -> list[float]:
+                vals: list[float] = []
+                for cand in selected:
+                    a = cand.get(field_a) or []
+                    b = cand.get(field_b) or []
+                    for xa, xb in zip(a, b):
+                        if (
+                            isinstance(xa, (int, float))
+                            and isinstance(xb, (int, float))
+                            and xa == xa
+                            and xb == xb
+                        ):
+                            vals.append(abs(float(xa) - float(xb)))
+                return vals
+
+            def _p(vals: list[float], q: float) -> float:
+                return float(np.percentile(vals, q)) if vals else float("nan")
+
+            stored = _flat_abs("logprob_delta")
+            scalar_metrics: dict[str, float] = {
+                "rl/logprob_mismatch/abs_logprob_delta_p50": _p(stored, 50),
+                "rl/logprob_mismatch/abs_logprob_delta_p90": _p(stored, 90),
+            }
+            agg = (
+                f" | |logprob_delta| p50={_p(stored, 50):.4f} p90={_p(stored, 90):.4f}"
+            )
+            if output_weight is not None:
+                recomputed = _flat_abs("recompute_logprob_delta")
+                train_resid = _flat_abs_diff("recompute_train_logprob", "train_logprob")
+                inf_resid = _flat_abs_diff(
+                    "recompute_inference_logprob", "inference_logprob"
+                )
+                scalar_metrics.update(
+                    {
+                        "rl/logprob_mismatch/abs_recompute_logprob_delta_p50": _p(recomputed, 50),
+                        "rl/logprob_mismatch/abs_recompute_logprob_delta_p90": _p(recomputed, 90),
+                        "rl/logprob_mismatch/fp32_vs_native_train_resid_p50": _p(train_resid, 50),
+                        "rl/logprob_mismatch/fp32_vs_native_train_resid_p90": _p(train_resid, 90),
+                        "rl/logprob_mismatch/fp32_vs_native_inference_resid_p50": _p(inf_resid, 50),
+                        "rl/logprob_mismatch/fp32_vs_native_inference_resid_p90": _p(inf_resid, 90),
+                    }
+                )
+                agg += (
+                    f"; |recompute_logprob_delta| p50={_p(recomputed, 50):.4f} "
+                    f"p90={_p(recomputed, 90):.4f}"
+                    f"; fp32-vs-native train resid p50={_p(train_resid, 50):.4f} "
+                    f"p90={_p(train_resid, 90):.4f}"
+                    f"; inference resid p50={_p(inf_resid, 50):.4f} "
+                    f"p90={_p(inf_resid, 90):.4f}"
+                )
+
+            _wandb_writer = get_wandb_writer()
+            if _wandb_writer is not None:
+                _wandb_writer.log(scalar_metrics, step=iteration)
+
+            print_rank_0(
+                f"[Logprob-mismatch] iter {iteration}: gathered "
+                f"{len(gathered_vectors)} hidden-vector keys, "
+                f"{len(gathered_inference_topk)} inference top-k entries; "
+                f"selected {len(selected)} rollouts ({selected_tokens} tokens) -> "
+                f"{selected_hidden_hits} hidden-paired tokens, "
+                f"{selected_topk_hits} tokens with inference top-k"
+                + (", logit-recompute on" if output_weight is not None else "")
+                + agg
+            )
     _wandb_log_logprob_mismatch_candidates(selected, iteration)
+
+
+def _get_logit_output_weight(model) -> torch.Tensor | None:
+    """Return the (vocab, hidden) output projection weight, or None if unavailable.
+
+    Only supported without tensor-model parallelism (TP=1), since with TP>1 the
+    vocab dimension is sharded and would require an all-gather to reconstruct.
+    """
+    try:
+        if mpu.get_tensor_model_parallel_world_size() > 1:
+            print_rank_0(
+                "[Logprob-mismatch] logit recompute requires TP=1; skipping recompute."
+            )
+            return None
+    except Exception:
+        pass
+    try:
+        core = unwrap_model(model)
+        weight = getattr(getattr(core, "output_layer", None), "weight", None)
+        if weight is None or weight.numel() == 0:
+            embedding = getattr(core, "embedding", None)
+            weight = getattr(
+                getattr(embedding, "word_embeddings", None), "weight", None
+            )
+        if weight is None or weight.numel() == 0:
+            return None
+        return weight.detach()
+    except Exception as e:
+        print_rank_0(f"[Logprob-mismatch] could not fetch output weight: {e}")
+        return None
+
+
+def _get_logit_output_bias(model) -> torch.Tensor | None:
+    try:
+        core = unwrap_model(model)
+        bias = getattr(getattr(core, "output_layer", None), "bias", None)
+        return bias.detach().float() if bias is not None else None
+    except Exception:
+        return None
 
 
 def get_agent(args, parallel_generation_tasks: int | None = None):
@@ -1385,17 +1619,35 @@ def get_environment_rollouts(
     args = get_args()
     nvtx_range = get_nvtx_range()
 
+    from megatron.rl.mismatch_hidden_capture import (
+        clear_mismatch_hidden_capture,
+        mismatch_hidden_capture_enabled,
+    )
+
+    clear_mismatch_hidden_capture()
+
     router_dump_dir = os.environ.get("ROUTER_STUDY_DUMP_DIR", "")
-    if probe_needs_rollout_ids(args):
-        os.environ["RL_DETERMINISM_PROBE_DIR"] = str(
-            args.rl_determinism_probe_dir or args.rl_determinism_probe_write_targets_file
-        )
+    capture_hidden = mismatch_hidden_capture_enabled()
+    mismatch_logging = int(getattr(args, "rl_logprob_mismatch_num_examples", 0) or 0) > 0
+    if probe_needs_rollout_ids(args) or capture_hidden or mismatch_logging:
+        if probe_needs_rollout_ids(args):
+            os.environ["RL_DETERMINISM_PROBE_DIR"] = str(
+                args.rl_determinism_probe_dir or args.rl_determinism_probe_write_targets_file
+            )
+        if (capture_hidden or mismatch_logging) and not probe_needs_rollout_ids(args):
+            os.environ["RL_MISMATCH_HIDDEN_CAPTURE"] = "1"
         os.environ["ROUTER_STUDY_COLLECTION_ID"] = str(getattr(args, "curr_iteration", 0))
+    mismatch_top_k = int(getattr(args, "rl_logprob_mismatch_top_k", 0) or 0)
+    # Only force the inference engine to emit top-n logprobs when the W&B mismatch
+    # table needs them. The determinism-probe top-k probe points compute their own
+    # top-k from the log-probs in calculate_log_probs, so a probe-only run does not
+    # need this and should avoid the extra per-step engine work.
+    if mismatch_top_k > 0 and mismatch_logging:
+        os.environ["RL_LOGPROB_MISMATCH_TOPK"] = str(mismatch_top_k)
     if router_dump_dir:
         os.environ["ROUTER_STUDY_COLLECTION_ID"] = str(getattr(args, "curr_iteration", 0))
-        topk_for_dump = getattr(args, "rl_logprob_mismatch_top_k", 0)
-        if topk_for_dump > 0:
-            os.environ["ROUTER_STUDY_DUMP_TOPK"] = str(topk_for_dump)
+        if mismatch_top_k > 0:
+            os.environ["ROUTER_STUDY_DUMP_TOPK"] = str(mismatch_top_k)
         if not dist.is_initialized() or dist.get_rank() == 0:
             dump_path = Path(router_dump_dir)
             dump_path.mkdir(parents=True, exist_ok=True)
@@ -1792,6 +2044,25 @@ def selective_log_softmax(logits, index):
     return per_token_logps
 
 
+def inference_aligned_selective_log_softmax(logits: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+    """Extract selected logprobs using the same numerics as RL inference.
+
+    Inference converts logits to fp32 and applies ``F.log_softmax`` before gathering
+    the selected token. Training otherwise keeps bf16 logits and uses a different
+    log-softmax path inside ``selective_log_softmax``.
+    """
+    return fp32_selective_log_softmax(logits, index)
+
+
+def use_inference_aligned_logprob_path(args=None) -> bool:
+    if args is None:
+        args = get_args()
+    return bool(
+        getattr(args, "rl_match_train_logprob_path_to_inference", False)
+        or getattr(args, "rl_fp32_output_layer_logsoftmax", False)
+    )
+
+
 def topk_log_softmax(logits: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
     """Return top-k token ids and logprobs without materializing full log-softmax output."""
     topk_logprobs = []
@@ -1869,7 +2140,8 @@ def get_logprobs(
             # This is a hack to fix megatron's behaviour when flash-decode affects the training code flow.
             flash_decode = model.config.flash_decode
             model.config.flash_decode = False
-            fp32_output = not (args.fp16 or args.bf16)
+            match_inference_logprob_path = use_inference_aligned_logprob_path(args)
+            fp32_output = match_inference_logprob_path or not (args.fp16 or args.bf16)
             with torch.no_grad() if no_grad else nullcontext():
                 logits_or_hidden_states = model(
                     tokens,
@@ -1894,7 +2166,12 @@ def get_logprobs(
                 logits_for_targets = match_logits_to_inference_moments(
                     logits_for_targets, inference_logit_means, inference_logit_stds
                 )
-                logprobs = selective_log_softmax(logits_for_targets, tokens[:, 1:])
+                if match_inference_logprob_path:
+                    logprobs = inference_aligned_selective_log_softmax(
+                        logits_for_targets, tokens[:, 1:]
+                    )
+                else:
+                    logprobs = selective_log_softmax(logits_for_targets, tokens[:, 1:])
                 selected_logprobs_for_probe = torch.full(
                     tokens.shape,
                     float("nan"),
@@ -1906,6 +2183,27 @@ def get_logprobs(
                     "lm_selected_logprob",
                     selected_logprobs_for_probe.unsqueeze(-1),
                 )
+                probe_topk = active_probe_topk()
+                if probe_topk > 0:
+                    # Per-token top-k logprobs/ids written to the determinism-probe
+                    # JSONL (aligned to the same per-token metadata as the hidden
+                    # states). Only computed while a training probe scope is active.
+                    k = min(probe_topk, logits_for_targets.shape[-1])
+                    tk_vals, tk_idx = topk_log_softmax(logits_for_targets, k)
+                    b, sm1, kk = tk_vals.shape
+                    full_tk_vals = torch.full(
+                        (b, sm1 + 1, kk),
+                        float("nan"),
+                        dtype=tk_vals.dtype,
+                        device=tk_vals.device,
+                    )
+                    full_tk_vals[:, :-1, :] = tk_vals
+                    full_tk_ids = torch.full(
+                        (b, sm1 + 1, kk), -1, dtype=torch.int64, device=tk_idx.device
+                    )
+                    full_tk_ids[:, :-1, :] = tk_idx
+                    probe_tensor_point("lm_topk_logprobs", full_tk_vals)
+                    probe_tensor_point("lm_topk_token_ids", full_tk_ids)
                 if topk_logprobs > 0:
                     topk_values, topk_indices = topk_log_softmax(
                         logits_for_targets, topk_logprobs
@@ -2448,12 +2746,15 @@ def logprobs_forward_step(
     if not match_logit_moments:
         b_logit_means, b_logit_stds = None, None
 
+    from megatron.rl.mismatch_hidden_capture import mismatch_hidden_capture_enabled
+
     probe_context = nullcontext()
     if (
         packing_context is None
         and b_probe_seq_indices is not None
         and probe_turn_metadata is not None
         and probe_generation_masks is not None
+        and (probe_enabled(get_args()) or mismatch_hidden_capture_enabled())
     ):
         token_metadata = build_training_token_metadata(
             tokens=b_trajs,
@@ -2470,7 +2771,7 @@ def logprobs_forward_step(
             batch_size=int(b_trajs.shape[0]),
             seq_length=int(b_trajs.shape[1]),
             extra={"seq_indices": b_probe_seq_indices.detach().cpu().tolist()},
-            probe=get_determinism_probe(model),
+            probe=get_determinism_probe(model) if probe_enabled(get_args()) else None,
         )
 
     with probe_context:
@@ -2566,7 +2867,11 @@ def compute_logprobs_batch(
 
     if is_pp_last_stage(pp_group):
         logprobs = torch.concat(logprobs_list, dim=0)
-        expected_dtype = torch.float32 if match_logit_moments else dtype
+        expected_dtype = (
+            torch.float32
+            if match_logit_moments or use_inference_aligned_logprob_path(args)
+            else dtype
+        )
         assert logprobs.dtype == expected_dtype
         if topk_logprobs > 0:
             all_topk_logprobs = torch.concat(topk_logprobs_list, dim=0)
@@ -3778,6 +4083,7 @@ def prepare_data_for_update(
     args = get_args()
     nvtx_range = get_nvtx_range()
     runtime_state = get_rl_runtime_state()
+    from megatron.rl.mismatch_hidden_capture import mismatch_hidden_capture_enabled
 
     if args.cuda_graph_impl != "none" and not args.rl_training_cuda_graphs:
         lang_module = (
@@ -3863,15 +4169,20 @@ def prepare_data_for_update(
             local_turn_metadata = _build_logprob_mismatch_turn_metadata(
                 rollouts, flattened_rollout_metadata, inference_top_logprobs_by_turn
             )
-            if probe_enabled(args):
+            if probe_enabled(args) or mismatch_hidden_capture_enabled():
                 runtime_state.probe_turn_metadata = local_turn_metadata
                 runtime_state.probe_generation_masks = generation_masks
                 runtime_state.probe_tokens = trajs
                 runtime_state.probe_iteration = iteration
-                if sequence_packing:
+                if sequence_packing and probe_enabled(args):
                     print_rank_0(
                         "[RL-determinism-probe] sequence packing is enabled; "
                         "training-side activation probe scopes are disabled"
+                    )
+                if sequence_packing and mismatch_hidden_capture_enabled():
+                    print_rank_0(
+                        "[Logprob-mismatch] sequence packing is enabled; "
+                        "training-side hidden capture is disabled"
                     )
             all_turn_metadata = (
                 _gather_logprob_mismatch_turn_metadata(local_turn_metadata)
@@ -3952,7 +4263,7 @@ def prepare_data_for_update(
                     ]
                     if inference_logit_means is not None and inference_logit_stds is not None:
                         dataset_tensors.extend([inference_logit_means, inference_logit_stds])
-                    if probe_enabled(args):
+                    if probe_enabled(args) or mismatch_hidden_capture_enabled():
                         dataset_tensors.append(torch.arange(len(compute_trajs), dtype=torch.long))
                     data_loader = DataLoader(
                         TensorDataset(*dataset_tensors), batch_size=args.micro_batch_size
@@ -3966,7 +4277,7 @@ def prepare_data_for_update(
                     ]
                     if inference_logit_means is not None and inference_logit_stds is not None:
                         dataset_tensors.extend([inference_logit_means, inference_logit_stds])
-                    if probe_enabled(args):
+                    if probe_enabled(args) or mismatch_hidden_capture_enabled():
                         dataset_tensors.append(torch.arange(len(compute_trajs), dtype=torch.long))
                     data_loader = DataLoader(
                         TensorDataset(*dataset_tensors), batch_size=args.micro_batch_size
@@ -3981,6 +4292,7 @@ def prepare_data_for_update(
                 args.cuda_graph_impl == "local"
                 and CudaGraphScope.full_iteration in args.cuda_graph_scope
                 and not probe_enabled(args)
+                and not mismatch_hidden_capture_enabled()
             ):
                 forward_backward_func = FullCudaGraphWrapper(
                     forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps
@@ -4148,6 +4460,7 @@ def prepare_data_for_update(
                     iteration=iteration,
                     train_topk_logprobs=old_topk_logprobs,
                     train_topk_indices=old_topk_indices,
+                    model=model,
                 )
             with nvtx_range("create_dataloader"):
                 # @vitalyk: This function also reconfigures the data loader to count the
@@ -4191,6 +4504,7 @@ def prepare_data_for_update(
                     iteration=iteration,
                     train_topk_logprobs=old_topk_logprobs,
                     train_topk_indices=old_topk_indices,
+                    model=model,
                 )
                 _maybe_write_determinism_probe_targets(
                     old_logprobs=old_logprobs,

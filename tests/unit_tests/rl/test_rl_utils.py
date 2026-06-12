@@ -564,6 +564,29 @@ class TestRLUtils:
         torch.testing.assert_close(matched[0, 0].std(unbiased=False), torch.tensor(2.0))
         torch.testing.assert_close(matched[0, 1], logits[0, 1])
 
+    def test_inference_aligned_selective_log_softmax_matches_inference_path(self):
+        logits = torch.randn(2, 3, 5, dtype=torch.float32)
+        labels = torch.randint(0, 5, (2, 3))
+        inference_logits = logits.to(torch.bfloat16).float()
+        expected = torch.gather(
+            torch.nn.functional.log_softmax(inference_logits, dim=-1),
+            dim=-1,
+            index=labels.unsqueeze(-1),
+        ).squeeze(-1)
+
+        aligned = rl_utils.inference_aligned_selective_log_softmax(logits.to(torch.bfloat16), labels)
+        torch.testing.assert_close(aligned, expected)
+
+        legacy = rl_utils.selective_log_softmax(logits.to(torch.bfloat16), labels)
+        assert not torch.allclose(legacy, expected)
+
+    def test_fp32_output_layer_flag_implies_inference_aligned_logprob_path(self):
+        class Args:
+            rl_match_train_logprob_path_to_inference = False
+            rl_fp32_output_layer_logsoftmax = True
+
+        assert rl_utils.use_inference_aligned_logprob_path(Args())
+
     def test_logprob_mismatch_candidate_respects_positive_token_cap(self):
         old_logprobs = torch.tensor([0.0, -0.2, -0.4, -0.6, -0.8])
         inference_logprobs = torch.tensor([0.0, -0.3, -0.1, -0.9, -0.8])
@@ -626,6 +649,8 @@ class TestRLUtils:
         )
 
         assert candidate["train_topk_tokens"][0] is None
+        assert candidate["inference_topk_tokens"][0] == ["1", "2"]
+        assert candidate["inference_topk_available"][0]
         assert candidate["train_topk_tokens"][1] == ["4", "5", "6"]
         assert candidate["train_topk_available"][1]
         assert candidate["train_top1_token"][1] == "4"

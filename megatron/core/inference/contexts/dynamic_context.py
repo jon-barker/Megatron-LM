@@ -7,7 +7,6 @@ from contextlib import nullcontext
 from typing import List, Optional, Sequence, Tuple
 
 import torch  # type: ignore
-import torch.nn.functional as F  # type: ignore
 from torch import Tensor  # type: ignore
 
 from megatron.core import parallel_state
@@ -28,6 +27,7 @@ from megatron.core.inference.unified_memory import (
 )
 from megatron.core.inference.utils import device_memory_summary, tensor_swap
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
+from megatron.core.models.common.output_layer import fp32_log_softmax
 from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.ssm.mamba_hybrid_layer_allocation import get_layer_maps_from_layer_type_list
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
@@ -2926,14 +2926,28 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         if only_last_token_logits or self.is_decode_only():
             seq_idx = torch.arange(len(new_tokens), dtype=torch.int32, device=logits.device)
-            log_probs = F.log_softmax(logits_squeezed[seq_idx], dim=-1)
+            log_probs = fp32_log_softmax(logits_squeezed[seq_idx], dim=-1)
             selected_log_probs = log_probs[seq_idx, new_tokens]
             try:
+                import os
+
+                import torch.distributed as dist
+
                 from megatron.rl.determinism_probe import (
-                    active_generated_token_metadata,
+                    active_probe_topk,
+                    build_inference_selected_logprob_metadata,
                     probe_tensor_point,
                 )
-                selected_metadata = active_generated_token_metadata()
+
+                collection_id = os.environ.get("ROUTER_STUDY_COLLECTION_ID", "unknown")
+                rank = dist.get_rank() if dist.is_initialized() else 0
+                selected_metadata = build_inference_selected_logprob_metadata(
+                    context=self,
+                    new_tokens=new_tokens,
+                    collection_id=collection_id,
+                    rank=rank,
+                    only_last_token_logits=only_last_token_logits,
+                )
                 probe_tensor_point(
                     "lm_selected_logprob",
                     selected_log_probs.unsqueeze(-1),
@@ -2943,6 +2957,19 @@ class DynamicInferenceContext(BaseInferenceContext):
                         else None
                     ),
                 )
+                _probe_topk = active_probe_topk()
+                if _probe_topk > 0:
+                    _k = min(_probe_topk, log_probs.shape[-1])
+                    _tk_vals, _tk_idx = torch.topk(log_probs, _k, dim=-1)
+                    _tm = (
+                        selected_metadata
+                        if len(selected_metadata) == _tk_vals.shape[0]
+                        else None
+                    )
+                    probe_tensor_point("lm_topk_logprobs", _tk_vals, token_metadata=_tm)
+                    probe_tensor_point(
+                        "lm_topk_token_ids", _tk_idx.to(torch.int64), token_metadata=_tm
+                    )
             except ImportError:
                 pass
             if return_logit_stats:
@@ -2957,7 +2984,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 [[std] for std in logit_stds] if logit_stds is not None else None,
             )
 
-        log_probs = F.log_softmax(logits_squeezed, dim=-1)
+        log_probs = fp32_log_softmax(logits_squeezed, dim=-1)
         # Get the selected token ids for all tokens.
         # We shift the active token window left by one to remove the first prompt token for
         # prefill requests and then set the token ids explicitly for the newly generated tokens.
@@ -2994,11 +3021,25 @@ class DynamicInferenceContext(BaseInferenceContext):
         seq_idx = torch.arange(self.active_token_count, device=log_probs.device)
         selected_log_probs = log_probs[seq_idx, active_token_ids]
         try:
+            import os
+
+            import torch.distributed as dist
+
             from megatron.rl.determinism_probe import (
-                active_nonpadding_token_metadata,
+                active_probe_topk,
+                build_inference_selected_logprob_metadata,
                 probe_tensor_point,
             )
-            selected_metadata = active_nonpadding_token_metadata()
+
+            collection_id = os.environ.get("ROUTER_STUDY_COLLECTION_ID", "unknown")
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            selected_metadata = build_inference_selected_logprob_metadata(
+                context=self,
+                new_tokens=new_tokens,
+                collection_id=collection_id,
+                rank=rank,
+                only_last_token_logits=only_last_token_logits,
+            )
             probe_tensor_point(
                 "lm_selected_logprob",
                 selected_log_probs.unsqueeze(-1),
@@ -3008,6 +3049,19 @@ class DynamicInferenceContext(BaseInferenceContext):
                     else None
                 ),
             )
+            _probe_topk = active_probe_topk()
+            if _probe_topk > 0:
+                _k = min(_probe_topk, log_probs.shape[-1])
+                _tk_vals, _tk_idx = torch.topk(log_probs[seq_idx], _k, dim=-1)
+                _tm = (
+                    selected_metadata
+                    if len(selected_metadata) == _tk_vals.shape[0]
+                    else None
+                )
+                probe_tensor_point("lm_topk_logprobs", _tk_vals, token_metadata=_tm)
+                probe_tensor_point(
+                    "lm_topk_token_ids", _tk_idx.to(torch.int64), token_metadata=_tm
+                )
         except ImportError:
             pass
 

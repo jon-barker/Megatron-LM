@@ -503,6 +503,12 @@ if __name__ == "__main__":
             help='Maximum number of real prompt batches to use for router-study gradient cosine.',
         )
         group.add_argument(
+            '--extract-output-weight-npy',
+            type=str,
+            default=None,
+            help='Load the model, write output_layer.weight as float32 .npy [vocab, hidden], and exit.',
+        )
+        group.add_argument(
             '--output-layer-sensitivity-mode',
             action='store_true',
             default=False,

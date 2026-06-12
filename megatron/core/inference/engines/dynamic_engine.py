@@ -886,11 +886,13 @@ class DynamicInferenceEngine(AbstractEngine):
         if request.status is None:
             request.status = Status.ACTIVE_AND_GENERATING_TOKENS
 
-        dump_topk = int(os.environ.get("ROUTER_STUDY_DUMP_TOPK", "0"))
-        if os.environ.get("ROUTER_STUDY_DUMP_DIR", "") and dump_topk > 0:
+        dump_topk = int(os.environ.get("ROUTER_STUDY_DUMP_TOPK", "0") or "0")
+        mismatch_topk = int(os.environ.get("RL_LOGPROB_MISMATCH_TOPK", "0") or "0")
+        effective_topk = max(dump_topk, mismatch_topk)
+        if effective_topk > 0:
             request.sampling_params.return_log_probs = True
             request.sampling_params.top_n_logprobs = max(
-                int(request.sampling_params.top_n_logprobs), dump_topk
+                int(request.sampling_params.top_n_logprobs), effective_topk
             )
 
         assert (
@@ -1005,13 +1007,17 @@ class DynamicInferenceEngine(AbstractEngine):
             raise Exception("specialize for <%s>." % type(prompt).__name__)
 
         routing_dump_id = None
-        if os.environ.get("ROUTER_STUDY_DUMP_DIR", "") or os.environ.get(
-            "RL_DETERMINISM_PROBE_DIR", ""
+        if (
+            os.environ.get("ROUTER_STUDY_DUMP_DIR", "")
+            or os.environ.get("RL_DETERMINISM_PROBE_DIR", "")
+            or os.environ.get("RL_MISMATCH_HIDDEN_CAPTURE", "")
         ):
             rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
             collection_id = os.environ.get("ROUTER_STUDY_COLLECTION_ID", "unknown")
             routing_dump_id = f"{collection_id}_{rank:04d}_{request_id:08d}"
-        if os.environ.get("RL_DETERMINISM_PROBE_DIR", ""):
+        if os.environ.get("RL_DETERMINISM_PROBE_DIR", "") or os.environ.get(
+            "RL_MISMATCH_HIDDEN_CAPTURE", ""
+        ):
             try:
                 from megatron.rl.determinism_probe import register_inference_request
                 register_inference_request(
@@ -1151,7 +1157,9 @@ class DynamicInferenceEngine(AbstractEngine):
                 if request_id not in self.stop_word_being_finished_ids:
                     is_first_token = len(request.generated_tokens) == 0
                     request.generated_tokens += tokens
-                    if os.environ.get("RL_DETERMINISM_PROBE_DIR", ""):
+                    if os.environ.get("RL_DETERMINISM_PROBE_DIR", "") or os.environ.get(
+                        "RL_MISMATCH_HIDDEN_CAPTURE", ""
+                    ):
                         try:
                             from megatron.rl.determinism_probe import (
                                 update_inference_request_generated_tokens,
@@ -1346,7 +1354,24 @@ class DynamicInferenceEngine(AbstractEngine):
                     ):
                         request.prompt_top_n_logprobs.append(logit_dict)
                     else:
+                        gen_offset = len(request.generated_top_n_logprobs)
                         request.generated_top_n_logprobs.append(logit_dict)
+                        if os.environ.get("RL_MISMATCH_HIDDEN_CAPTURE", "") or os.environ.get(
+                            "RL_DETERMINISM_PROBE_DIR", ""
+                        ):
+                            try:
+                                from megatron.rl.mismatch_hidden_capture import (
+                                    record_inference_topk,
+                                )
+
+                                record_inference_topk(
+                                    request.routing_dump_id,
+                                    gen_offset,
+                                    list(logit_dict.keys()),
+                                    list(logit_dict.values()),
+                                )
+                            except ImportError:
+                                pass
 
             # Process routing indices if available (keyed by request_id)
             # Each step's routing is a tensor of shape [num_tokens_this_step, num_layers, topk]

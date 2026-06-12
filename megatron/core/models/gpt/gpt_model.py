@@ -17,6 +17,10 @@ from megatron.core.models.common.embeddings.rotary_pos_embedding import (
     RotaryEmbedding,
 )
 from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.models.common.output_layer import (
+    fp32_output_layer,
+    use_fp32_output_layer_logsoftmax,
+)
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
@@ -656,8 +660,20 @@ class GPTModel(LanguageModule):
         sequence_parallel_override = False
 
         try:
-            from megatron.rl.determinism_probe import probe_tensor_point
-            probe_tensor_point("lm_final_hidden", hidden_states)
+            from megatron.rl.determinism_probe import (
+                active_token_metadata_for_first_dim,
+                probe_tensor_point,
+            )
+            from megatron.rl.mismatch_hidden_capture import maybe_capture_lm_final_hidden
+
+            probe_tensor_point(
+                "lm_final_hidden",
+                hidden_states,
+                token_metadata=active_token_metadata_for_first_dim(
+                    hidden_states, tp_group=self.pg_collection.tp
+                ),
+            )
+            maybe_capture_lm_final_hidden(hidden_states)
         except ImportError:
             pass
 
@@ -680,9 +696,17 @@ class GPTModel(LanguageModule):
                 reshaped = hidden_states.squeeze(1).unsqueeze(0)
                 hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
 
-        logits, _ = self.output_layer(
-            hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
-        )
+        if use_fp32_output_layer_logsoftmax(self.config):
+            logits, _ = fp32_output_layer(
+                self.output_layer,
+                hidden_states,
+                weight=output_weight,
+                runtime_gather_output=runtime_gather_output,
+            )
+        else:
+            logits, _ = self.output_layer(
+                hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+            )
 
         # Apply MuP output scaling to logits
         logits = self._scale_logits(logits)
@@ -757,9 +781,17 @@ class GPTModel(LanguageModule):
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
 
-        logits, _ = self.output_layer(
-            mtp_hidden, weight=output_weight, runtime_gather_output=runtime_gather_output
-        )
+        if use_fp32_output_layer_logsoftmax(self.config):
+            logits, _ = fp32_output_layer(
+                self.output_layer,
+                mtp_hidden,
+                weight=output_weight,
+                runtime_gather_output=runtime_gather_output,
+            )
+        else:
+            logits, _ = self.output_layer(
+                mtp_hidden, weight=output_weight, runtime_gather_output=runtime_gather_output
+            )
         logits = self._scale_logits(logits)
 
         return mtp_hidden, logits

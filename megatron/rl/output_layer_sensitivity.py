@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -207,6 +208,191 @@ def _value_tensor(record: dict[str, Any], device: torch.device) -> torch.Tensor 
     return torch.tensor(data, dtype=torch.float32, device=device)
 
 
+def _probed_logit_metadata(record: dict[str, Any]) -> dict[str, Any] | None:
+    value = record.get("value") or {}
+    data = value.get("data")
+    if not data:
+        return None
+    stored_numel = len(data)
+    original_numel = int(value.get("original_numel", stored_numel))
+    truncated = bool(value.get("truncated", False))
+    return {
+        "stored_numel": stored_numel,
+        "original_numel": original_numel,
+        "truncated": truncated,
+    }
+
+
+def _selected_logit_from_probed_row(logits_row: torch.Tensor, token_id: int) -> torch.Tensor | None:
+    if token_id < 0 or token_id >= logits_row.numel():
+        return None
+    return logits_row[token_id]
+
+
+def _build_probed_logits_analysis(
+    *,
+    keys: list[tuple[Any, ...]],
+    token_ids: list[int],
+    inf_logits: dict[tuple[Any, ...], dict[str, Any]],
+    train_logits: dict[tuple[Any, ...], dict[str, Any]],
+    device: torch.device,
+    vocab_size: int,
+) -> dict[str, Any] | None:
+    probed_inf_rows = []
+    probed_train_rows = []
+    probed_key_indices = []
+    full_vocab_rows = 0
+    for index, key in enumerate(keys):
+        inf_record = inf_logits.get(key)
+        train_record = train_logits.get(key)
+        if inf_record is None or train_record is None:
+            continue
+        inf_row = _value_tensor(inf_record, device)
+        train_row = _value_tensor(train_record, device)
+        if inf_row is None or train_row is None or inf_row.numel() != train_row.numel():
+            continue
+        token_id = int(token_ids[index])
+        if (
+            _selected_logit_from_probed_row(inf_row, token_id) is None
+            or _selected_logit_from_probed_row(train_row, token_id) is None
+        ):
+            continue
+        inf_meta = _probed_logit_metadata(inf_record)
+        train_meta = _probed_logit_metadata(train_record)
+        if inf_meta is None or train_meta is None:
+            continue
+        if (
+            not inf_meta["truncated"]
+            and not train_meta["truncated"]
+            and inf_meta["original_numel"] == vocab_size
+            and train_meta["original_numel"] == vocab_size
+        ):
+            full_vocab_rows += 1
+        probed_inf_rows.append(inf_row)
+        probed_train_rows.append(train_row)
+        probed_key_indices.append(index)
+
+    if not probed_inf_rows:
+        return None
+
+    logits_inf = torch.stack(probed_inf_rows)
+    logits_train = torch.stack(probed_train_rows)
+    token_ids_t = torch.tensor([token_ids[i] for i in probed_key_indices], dtype=torch.long, device=device)
+    row_ids = torch.arange(logits_inf.shape[0], device=device)
+    selected_logits_inf = logits_inf[row_ids, token_ids_t]
+    selected_logits_train = logits_train[row_ids, token_ids_t]
+    selected_logit_delta = selected_logits_train - selected_logits_inf
+    _, selected_logprobs_inf = _selected_values(logits_inf, token_ids_t)
+    _, selected_logprobs_train = _selected_values(logits_train, token_ids_t)
+    selected_logprob_delta = selected_logprobs_train - selected_logprobs_inf
+
+    inf_top2 = torch.topk(logits_inf, k=min(2, logits_inf.shape[-1]), dim=-1)
+    train_top2 = torch.topk(logits_train, k=min(2, logits_train.shape[-1]), dim=-1)
+    return {
+        "matched_records": len(probed_key_indices),
+        "matched_fraction_of_hidden": len(probed_key_indices) / max(len(keys), 1),
+        "full_vocab_rows": full_vocab_rows,
+        "stored_vocab_size": int(logits_inf.shape[-1]),
+        "key_indices": probed_key_indices,
+        "logits_inf": logits_inf,
+        "logits_train": logits_train,
+        "selected_logits_inf": selected_logits_inf,
+        "selected_logits_train": selected_logits_train,
+        "selected_logit_delta": selected_logit_delta,
+        "selected_logit_abs": selected_logit_delta.abs(),
+        "selected_logprob_delta": selected_logprob_delta,
+        "selected_logprob_abs": selected_logprob_delta.abs(),
+        "inf_top1": inf_top2.indices[:, 0],
+        "train_top1": train_top2.indices[:, 0],
+        "inf_top2_token": inf_top2.indices[:, 1],
+        "train_top2_token": train_top2.indices[:, 1],
+        "inf_top1_margin": inf_top2.values[:, 0] - inf_top2.values[:, 1],
+        "train_top1_margin": train_top2.values[:, 0] - train_top2.values[:, 1],
+    }
+
+
+def _output_weight_svd_alignment(
+    *,
+    delta: torch.Tensor,
+    selected_logit_abs: torch.Tensor,
+    selected_logprob_abs: torch.Tensor,
+    output_weight: torch.Tensor,
+    svd_components: int,
+    svd_chunk_size: int,
+    logit_source: str,
+) -> dict[str, Any]:
+    print_rank_0(
+        f"[Output-layer-sensitivity] computing top {svd_components} output-weight SVD directions "
+        f"for {logit_source} logit deltas (n={delta.shape[0]})"
+    )
+    singular_values, right_vectors = _top_right_singular_vectors(
+        output_weight,
+        num_components=svd_components,
+        chunk_size=svd_chunk_size,
+    )
+    projections = delta.float().matmul(right_vectors.t())
+    abs_projections = projections.abs()
+    abs_cosines = abs_projections / delta.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    weighted_abs_projections = abs_projections * singular_values.unsqueeze(0)
+    topk_projection_l2 = projections.norm(dim=-1)
+    delta_norm = delta.norm(dim=-1)
+    topk_energy_fraction = topk_projection_l2 / delta_norm.clamp_min(1e-12)
+    max_abs_projection = abs_projections.max(dim=-1).values
+    max_abs_cosine = abs_cosines.max(dim=-1).values
+    max_weighted_abs_projection = weighted_abs_projections.max(dim=-1).values
+
+    per_component = []
+    for idx in range(svd_components):
+        per_component.append(
+            {
+                "component": idx,
+                "singular_value": float(singular_values[idx].item()),
+                "abs_projection": _percentiles(abs_projections[:, idx]),
+                "abs_cosine": _percentiles(abs_cosines[:, idx]),
+                "corr_abs_projection_vs_selected_logit_abs_delta": _pearson_corr(
+                    abs_projections[:, idx], selected_logit_abs
+                ),
+                "spearman_abs_projection_vs_selected_logit_abs_delta": _spearman_corr(
+                    abs_projections[:, idx], selected_logit_abs
+                ),
+                "corr_abs_projection_vs_selected_logprob_abs_delta": _pearson_corr(
+                    abs_projections[:, idx], selected_logprob_abs
+                ),
+            }
+        )
+
+    return {
+        "logit_source": logit_source,
+        "num_records": int(delta.shape[0]),
+        "num_components": int(svd_components),
+        "singular_values": [float(x.item()) for x in singular_values],
+        "topk_projection_l2": _percentiles(topk_projection_l2),
+        "topk_energy_fraction": _percentiles(topk_energy_fraction),
+        "max_abs_projection": _percentiles(max_abs_projection),
+        "max_abs_cosine": _percentiles(max_abs_cosine),
+        "max_weighted_abs_projection": _percentiles(max_weighted_abs_projection),
+        "corr_topk_projection_l2_vs_selected_logit_abs_delta": _pearson_corr(
+            topk_projection_l2, selected_logit_abs
+        ),
+        "corr_topk_energy_fraction_vs_selected_logit_abs_delta": _pearson_corr(
+            topk_energy_fraction, selected_logit_abs
+        ),
+        "corr_max_abs_projection_vs_selected_logit_abs_delta": _pearson_corr(
+            max_abs_projection, selected_logit_abs
+        ),
+        "corr_max_abs_cosine_vs_selected_logit_abs_delta": _pearson_corr(
+            max_abs_cosine, selected_logit_abs
+        ),
+        "corr_max_weighted_abs_projection_vs_selected_logit_abs_delta": _pearson_corr(
+            max_weighted_abs_projection, selected_logit_abs
+        ),
+        "spearman_max_weighted_abs_projection_vs_selected_logit_abs_delta": _spearman_corr(
+            max_weighted_abs_projection, selected_logit_abs
+        ),
+        "per_component": per_component,
+    }
+
+
 def _analyze_observed_probe_hidden_deltas(
     *,
     output_layer,
@@ -222,6 +408,8 @@ def _analyze_observed_probe_hidden_deltas(
 
     inf_hidden = _load_probe_records(probe_dir, inference_phase, "lm_final_hidden")
     train_hidden = _load_probe_records(probe_dir, training_phase, "lm_final_hidden")
+    inf_logits_records = _load_probe_records(probe_dir, inference_phase, "lm_logits")
+    train_logits_records = _load_probe_records(probe_dir, training_phase, "lm_logits")
     inf_logprob = _load_probe_records(probe_dir, inference_phase, "lm_selected_logprob")
     train_logprob = _load_probe_records(probe_dir, training_phase, "lm_selected_logprob")
     shared = sorted(set(inf_hidden) & set(train_hidden))
@@ -274,23 +462,65 @@ def _analyze_observed_probe_hidden_deltas(
     projected_logit_delta = (delta * selected_weight).sum(dim=-1)
 
     with torch.no_grad():
-        logits_inf = _run_output_layer(output_layer, inf_h.to(output_weight.dtype))
-        logits_train = _run_output_layer(output_layer, train_h.to(output_weight.dtype))
-        selected_logits_inf, selected_logprobs_inf = _selected_values(logits_inf, token_ids_t)
-        selected_logits_train, selected_logprobs_train = _selected_values(logits_train, token_ids_t)
+        logits_inf_recomputed = _run_output_layer(output_layer, inf_h.to(output_weight.dtype))
+        logits_train_recomputed = _run_output_layer(output_layer, train_h.to(output_weight.dtype))
+        selected_logits_inf, selected_logprobs_inf = _selected_values(logits_inf_recomputed, token_ids_t)
+        selected_logits_train, selected_logprobs_train = _selected_values(logits_train_recomputed, token_ids_t)
 
-    selected_logit_delta = selected_logits_train - selected_logits_inf
-    selected_logprob_delta = selected_logprobs_train - selected_logprobs_inf
-    selected_logit_abs = selected_logit_delta.abs()
-    selected_logprob_abs = selected_logprob_delta.abs()
-    inf_top2 = torch.topk(logits_inf.float(), k=2, dim=-1)
-    train_top2 = torch.topk(logits_train.float(), k=2, dim=-1)
-    inf_top1 = inf_top2.indices[:, 0]
-    train_top1 = train_top2.indices[:, 0]
-    inf_top2_token = inf_top2.indices[:, 1]
-    train_top2_token = train_top2.indices[:, 1]
-    inf_top1_margin = inf_top2.values[:, 0] - inf_top2.values[:, 1]
-    train_top1_margin = train_top2.values[:, 0] - train_top2.values[:, 1]
+    selected_logit_delta_recomputed = selected_logits_train - selected_logits_inf
+    selected_logprob_delta_recomputed = selected_logprobs_train - selected_logprobs_inf
+    selected_logit_abs_recomputed = selected_logit_delta_recomputed.abs()
+    selected_logprob_abs_recomputed = selected_logprob_delta_recomputed.abs()
+    inf_top2_recomputed = torch.topk(logits_inf_recomputed.float(), k=2, dim=-1)
+    train_top2_recomputed = torch.topk(logits_train_recomputed.float(), k=2, dim=-1)
+    inf_top1_recomputed = inf_top2_recomputed.indices[:, 0]
+    train_top1_recomputed = train_top2_recomputed.indices[:, 0]
+    inf_top2_token_recomputed = inf_top2_recomputed.indices[:, 1]
+    train_top2_token_recomputed = train_top2_recomputed.indices[:, 1]
+    inf_top1_margin_recomputed = inf_top2_recomputed.values[:, 0] - inf_top2_recomputed.values[:, 1]
+    train_top1_margin_recomputed = train_top2_recomputed.values[:, 0] - train_top2_recomputed.values[:, 1]
+
+    probed_logits = _build_probed_logits_analysis(
+        keys=keys,
+        token_ids=token_ids,
+        inf_logits=inf_logits_records,
+        train_logits=train_logits_records,
+        device=device,
+        vocab_size=output_weight.shape[0],
+    )
+    if probed_logits is not None:
+        probed_indices = probed_logits["key_indices"]
+        recomputed_selected_for_probed = selected_logit_delta_recomputed[probed_indices]
+        probed_logits["selected_logit_recomputed_minus_probed_abs"] = (
+            recomputed_selected_for_probed - probed_logits["selected_logit_delta"]
+        ).abs()
+        logits_inf = probed_logits["logits_inf"]
+        logits_train = probed_logits["logits_train"]
+        selected_logit_delta = probed_logits["selected_logit_delta"]
+        selected_logprob_delta = probed_logits["selected_logprob_delta"]
+        selected_logit_abs = probed_logits["selected_logit_abs"]
+        selected_logprob_abs = probed_logits["selected_logprob_abs"]
+        inf_top1 = probed_logits["inf_top1"]
+        train_top1 = probed_logits["train_top1"]
+        inf_top2_token = probed_logits["inf_top2_token"]
+        train_top2_token = probed_logits["train_top2_token"]
+        inf_top1_margin = probed_logits["inf_top1_margin"]
+        train_top1_margin = probed_logits["train_top1_margin"]
+        logit_source = "probed_lm_logits"
+    else:
+        logits_inf = logits_inf_recomputed
+        logits_train = logits_train_recomputed
+        selected_logit_delta = selected_logit_delta_recomputed
+        selected_logprob_delta = selected_logprob_delta_recomputed
+        selected_logit_abs = selected_logit_abs_recomputed
+        selected_logprob_abs = selected_logprob_abs_recomputed
+        inf_top1 = inf_top1_recomputed
+        train_top1 = train_top1_recomputed
+        inf_top2_token = inf_top2_token_recomputed
+        train_top2_token = train_top2_token_recomputed
+        inf_top1_margin = inf_top1_margin_recomputed
+        train_top1_margin = train_top1_margin_recomputed
+        logit_source = "recomputed_from_hidden"
     probed_logprob_delta = []
     for key in keys:
         if key in inf_logprob and key in train_logprob:
@@ -300,32 +530,42 @@ def _analyze_observed_probe_hidden_deltas(
                 probed_logprob_delta.append((train_lp.flatten()[0] - inf_lp.flatten()[0]).float())
     probed_logprob_delta_t = torch.stack(probed_logprob_delta) if probed_logprob_delta else torch.empty(0, device=device)
 
-    selected_logit_abs = selected_logit_delta.abs()
-    selected_logprob_abs = selected_logprob_delta.abs()
+    if probed_logits is not None:
+        probed_indices = probed_logits["key_indices"]
+        token_ids_for_analysis = token_ids_t[probed_indices]
+        delta_for_analysis = delta[probed_indices]
+    else:
+        probed_indices = None
+        token_ids_for_analysis = token_ids_t
+        delta_for_analysis = delta
+
     result = {
         "probe_dir": probe_dir,
         "matched_hidden_records": len(keys),
         "inference_hidden_records": len(inf_hidden),
         "training_hidden_records": len(train_hidden),
+        "inference_logits_records": len(inf_logits_records),
+        "training_logits_records": len(train_logits_records),
+        "logit_source": logit_source,
         "relative_l2": _percentiles(delta_norm / train_norm),
         "delta_hidden_l2": _percentiles(delta_norm),
         "selected_weight_norm": _percentiles(weight_norm),
         "cos_delta_hidden_selected_weight": _percentiles(alignment.abs()),
         "signed_cos_delta_hidden_selected_weight": _percentiles(alignment),
         "projected_selected_logit_delta": _percentiles(projected_logit_delta.abs()),
-        "selected_logit_delta_recomputed": _percentiles(selected_logit_delta.abs()),
-        "selected_logprob_delta_recomputed": _percentiles(selected_logprob_delta.abs()),
+        "selected_logit_delta_recomputed": _percentiles(selected_logit_abs_recomputed),
+        "selected_logprob_delta_recomputed": _percentiles(selected_logprob_abs_recomputed),
         "selected_logprob_delta_probed": _percentiles(probed_logprob_delta_t.abs()),
         "inference_top1_margin": _percentiles(inf_top1_margin),
         "training_top1_margin": _percentiles(train_top1_margin),
         "top1_disagreement_count": int((inf_top1 != train_top1).sum().item()),
         "top1_agreement_count": int((inf_top1 == train_top1).sum().item()),
-        "selected_token_is_inference_top1_count": int((token_ids_t == inf_top1).sum().item()),
-        "selected_token_is_training_top1_count": int((token_ids_t == train_top1).sum().item()),
+        "selected_token_is_inference_top1_count": int((token_ids_for_analysis == inf_top1).sum().item()),
+        "selected_token_is_training_top1_count": int((token_ids_for_analysis == train_top1).sum().item()),
         "pair_direction_analysis": [
             _pair_direction_analysis(
                 name="training_top1_minus_inference_top1",
-                delta_hidden=delta,
+                delta_hidden=delta_for_analysis,
                 output_weight=output_weight,
                 logits_inf=logits_inf,
                 logits_train=logits_train,
@@ -336,29 +576,29 @@ def _analyze_observed_probe_hidden_deltas(
             ),
             _pair_direction_analysis(
                 name="selected_minus_inference_top1",
-                delta_hidden=delta,
+                delta_hidden=delta_for_analysis,
                 output_weight=output_weight,
                 logits_inf=logits_inf,
                 logits_train=logits_train,
-                token_a=token_ids_t,
+                token_a=token_ids_for_analysis,
                 token_b=inf_top1,
                 selected_logit_abs_delta=selected_logit_abs,
                 selected_logprob_abs_delta=selected_logprob_abs,
             ),
             _pair_direction_analysis(
                 name="selected_minus_training_top1",
-                delta_hidden=delta,
+                delta_hidden=delta_for_analysis,
                 output_weight=output_weight,
                 logits_inf=logits_inf,
                 logits_train=logits_train,
-                token_a=token_ids_t,
+                token_a=token_ids_for_analysis,
                 token_b=train_top1,
                 selected_logit_abs_delta=selected_logit_abs,
                 selected_logprob_abs_delta=selected_logprob_abs,
             ),
             _pair_direction_analysis(
                 name="inference_top1_minus_inference_top2",
-                delta_hidden=delta,
+                delta_hidden=delta_for_analysis,
                 output_weight=output_weight,
                 logits_inf=logits_inf,
                 logits_train=logits_train,
@@ -369,7 +609,7 @@ def _analyze_observed_probe_hidden_deltas(
             ),
             _pair_direction_analysis(
                 name="training_top1_minus_training_top2",
-                delta_hidden=delta,
+                delta_hidden=delta_for_analysis,
                 output_weight=output_weight,
                 logits_inf=logits_inf,
                 logits_train=logits_train,
@@ -380,82 +620,48 @@ def _analyze_observed_probe_hidden_deltas(
             ),
         ],
     }
-    if svd_components > 0:
-        print_rank_0(
-            f"[Output-layer-sensitivity] computing top {svd_components} output-weight SVD directions"
-        )
-        singular_values, right_vectors = _top_right_singular_vectors(
-            output_weight,
-            num_components=svd_components,
-            chunk_size=svd_chunk_size,
-        )
-        projections = delta.float().matmul(right_vectors.t())
-        abs_projections = projections.abs()
-        abs_cosines = abs_projections / delta_norm.clamp_min(1e-12).unsqueeze(-1)
-        weighted_abs_projections = abs_projections * singular_values.unsqueeze(0)
-        topk_projection_l2 = projections.norm(dim=-1)
-        topk_energy_fraction = topk_projection_l2 / delta_norm.clamp_min(1e-12)
-        max_abs_projection = abs_projections.max(dim=-1).values
-        max_abs_cosine = abs_cosines.max(dim=-1).values
-        max_weighted_abs_projection = weighted_abs_projections.max(dim=-1).values
-
-        per_component = []
-        for idx in range(svd_components):
-            per_component.append(
-                {
-                    "component": idx,
-                    "singular_value": float(singular_values[idx].item()),
-                    "abs_projection": _percentiles(abs_projections[:, idx]),
-                    "abs_cosine": _percentiles(abs_cosines[:, idx]),
-                    "corr_abs_projection_vs_selected_logit_abs_delta": _pearson_corr(
-                        abs_projections[:, idx], selected_logit_abs
-                    ),
-                    "spearman_abs_projection_vs_selected_logit_abs_delta": _spearman_corr(
-                        abs_projections[:, idx], selected_logit_abs
-                    ),
-                    "corr_abs_projection_vs_selected_logprob_abs_delta": _pearson_corr(
-                        abs_projections[:, idx], selected_logprob_abs
-                    ),
-                    # "corr_abs_projection_vs_selected_logit_abs_delta_to_idx": _pearson_corr(
-                    #     abs_projections[:, :idx].norm(dim=-1), selected_logit_abs
-                    # ),
-                    # "spearman_abs_projection_vs_selected_logit_abs_delta_to_idx": _spearman_corr(
-                    #     abs_projections[:, :idx].norm(dim=-1), selected_logit_abs
-                    # ),
-                    # "corr_abs_projection_vs_selected_logprob_abs_delta_to_idx": _pearson_corr(
-                    #     abs_projections[:, :idx].norm(dim=-1), selected_logprob_abs
-                    # ),
-                }
-            )
-
-        result["output_weight_svd_alignment"] = {
-            "num_components": int(svd_components),
-            "singular_values": [float(x.item()) for x in singular_values],
-            "topk_projection_l2": _percentiles(topk_projection_l2),
-            "topk_energy_fraction": _percentiles(topk_energy_fraction),
-            "max_abs_projection": _percentiles(max_abs_projection),
-            "max_abs_cosine": _percentiles(max_abs_cosine),
-            "max_weighted_abs_projection": _percentiles(max_weighted_abs_projection),
-            "corr_topk_projection_l2_vs_selected_logit_abs_delta": _pearson_corr(
-                topk_projection_l2, selected_logit_abs
+    if probed_logits is not None:
+        result["probed_lm_logits"] = {
+            "matched_records": probed_logits["matched_records"],
+            "matched_fraction_of_hidden": probed_logits["matched_fraction_of_hidden"],
+            "full_vocab_rows": probed_logits["full_vocab_rows"],
+            "stored_vocab_size": probed_logits["stored_vocab_size"],
+            "selected_logit_delta_probed": _percentiles(probed_logits["selected_logit_abs"]),
+            "selected_logprob_delta_from_probed_logits": _percentiles(probed_logits["selected_logprob_abs"]),
+            "selected_logit_recomputed_minus_probed_abs": _percentiles(
+                probed_logits["selected_logit_recomputed_minus_probed_abs"]
             ),
-            "corr_topk_energy_fraction_vs_selected_logit_abs_delta": _pearson_corr(
-                topk_energy_fraction, selected_logit_abs
+            "corr_recomputed_vs_probed_selected_logit_delta": _pearson_corr(
+                selected_logit_delta_recomputed[probed_indices],
+                probed_logits["selected_logit_delta"],
             ),
-            "corr_max_abs_projection_vs_selected_logit_abs_delta": _pearson_corr(
-                max_abs_projection, selected_logit_abs
+            "top1_scope": (
+                "full_vocab"
+                if probed_logits["full_vocab_rows"] == probed_logits["matched_records"]
+                else "stored_prefix_only"
             ),
-            "corr_max_abs_cosine_vs_selected_logit_abs_delta": _pearson_corr(
-                max_abs_cosine, selected_logit_abs
-            ),
-            "corr_max_weighted_abs_projection_vs_selected_logit_abs_delta": _pearson_corr(
-                max_weighted_abs_projection, selected_logit_abs
-            ),
-            "spearman_max_weighted_abs_projection_vs_selected_logit_abs_delta": _spearman_corr(
-                max_weighted_abs_projection, selected_logit_abs
-            ),
-            "per_component": per_component,
         }
+        result["selected_logit_delta_probed"] = result["probed_lm_logits"]["selected_logit_delta_probed"]
+    if svd_components > 0:
+        result["output_weight_svd_alignment"] = _output_weight_svd_alignment(
+            delta=delta_for_analysis,
+            selected_logit_abs=selected_logit_abs,
+            selected_logprob_abs=selected_logprob_abs,
+            output_weight=output_weight,
+            svd_components=svd_components,
+            svd_chunk_size=svd_chunk_size,
+            logit_source=logit_source,
+        )
+        if probed_logits is not None:
+            result["output_weight_svd_alignment_recomputed"] = _output_weight_svd_alignment(
+                delta=delta_for_analysis,
+                selected_logit_abs=selected_logit_abs_recomputed[probed_indices],
+                selected_logprob_abs=selected_logprob_abs_recomputed[probed_indices],
+                output_weight=output_weight,
+                svd_components=svd_components,
+                svd_chunk_size=svd_chunk_size,
+                logit_source="recomputed_from_hidden",
+            )
     return result
 
 
@@ -517,6 +723,30 @@ def _simulate_mode(
     }
 
 
+def extract_output_weight_npy(model: list, args) -> None:
+    """Write the loaded model's output-layer weight to a float32 .npy file."""
+    if dist.is_initialized() and dist.get_rank() != 0:
+        return
+
+    output_path = Path(getattr(args, "extract_output_weight_npy", ""))
+    if not str(output_path):
+        raise RuntimeError("--extract-output-weight-npy requires a destination path.")
+
+    module = unwrap_model(model[0])
+    if not hasattr(module, "output_layer"):
+        raise RuntimeError("Loaded model has no output_layer on this rank.")
+
+    weight = module.output_layer.weight.detach().float().cpu()
+    if weight.ndim != 2:
+        raise RuntimeError(f"Unexpected output layer shape: {tuple(weight.shape)}")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(output_path, weight.numpy())
+    print_rank_0(
+        f"[Extract-output-weight] wrote shape {tuple(weight.shape)} to {output_path}"
+    )
+
+
 def run_output_layer_sensitivity(model: list, args) -> None:
     """Run synthetic perturbations through the loaded model's output layer."""
     if dist.is_initialized() and dist.get_rank() != 0:
@@ -570,7 +800,9 @@ def run_output_layer_sensitivity(model: list, args) -> None:
         results["observed_probe_hidden_delta"] = observed
         print_rank_0(
             "[Output-layer-sensitivity] observed probe hidden records: "
-            f"{observed.get('matched_hidden_records', 0)}"
+            f"{observed.get('matched_hidden_records', 0)} "
+            f"(logit_source={observed.get('logit_source', 'unknown')}, "
+            f"probed_lm_logits={observed.get('probed_lm_logits', {}).get('matched_records', 0)})"
         )
     for mode in modes:
         for rel in rels:

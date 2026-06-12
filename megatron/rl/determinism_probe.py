@@ -36,6 +36,7 @@ class ProbeConfig:
     hash_inputs: bool = True
     store_values: bool = False
     value_max_elements: int = 0
+    topk: int = 0
 
     @classmethod
     def from_args(cls, args: Any) -> "ProbeConfig | None":
@@ -70,6 +71,7 @@ class ProbeConfig:
             value_max_elements=int(
                 getattr(args, "rl_determinism_probe_value_max_elements", 0) or 0
             ),
+            topk=int(getattr(args, "rl_logprob_mismatch_top_k", 0) or 0),
         )
 
 
@@ -351,6 +353,18 @@ def probe_tensor_point(
     scope.probe.record_tensor_point(name, value, tensor_path=tensor_path, token_metadata=token_metadata)
 
 
+def active_probe_topk() -> int:
+    """Return the configured top-k for the active probe scope, or 0 if not probing.
+
+    Used to gate (and size) per-token top-k logprob probe points so the expensive
+    full-vocab top-k is only computed while a determinism-probe scope is active.
+    """
+    scope = _ACTIVE_SCOPE.get()
+    if scope is None or scope.probe is None:
+        return 0
+    return int(getattr(scope.probe.config, "topk", 0) or 0)
+
+
 def active_generated_token_metadata() -> list[dict[str, Any]]:
     """Return generated-token metadata for the active probe scope."""
     scope = _ACTIVE_SCOPE.get()
@@ -368,6 +382,136 @@ def active_nonpadding_token_metadata() -> list[dict[str, Any]]:
     if scope is None:
         return []
     return [meta for meta in scope.token_metadata if not meta.get("is_padding")]
+
+
+def active_token_metadata_for_first_dim(
+    tensor: torch.Tensor,
+    *,
+    tp_group: Any | None = None,
+) -> list[dict[str, Any]] | None:
+    """Return active token metadata aligned to a tensor sharded on dim 0.
+
+    Final hidden states are recorded before the output layer. With sequence parallelism,
+    the first dimension is sharded across TP ranks, while the probe scope metadata covers
+    the full padded active-token sequence. Slice the metadata to the local TP shard so
+    manual probe points can still emit per-token rows and stored values.
+    """
+    scope = _ACTIVE_SCOPE.get()
+    if scope is None or tensor.ndim == 0:
+        return None
+
+    token_metadata = scope.token_metadata
+    local_rows = int(tensor.shape[0])
+    if len(token_metadata) == local_rows:
+        return token_metadata
+
+    if tp_group is None:
+        return None
+    try:
+        world_size = tp_group.size()
+        rank = tp_group.rank()
+    except Exception:
+        return None
+
+    if world_size <= 1 or len(token_metadata) % world_size != 0:
+        return None
+    rows_per_rank = len(token_metadata) // world_size
+    if rows_per_rank != local_rows:
+        return None
+    start = rank * rows_per_rank
+    return token_metadata[start : start + rows_per_rank]
+
+
+def build_inference_selected_logprob_metadata(
+    *,
+    context: Any,
+    new_tokens: torch.Tensor,
+    collection_id: str,
+    rank: int,
+    only_last_token_logits: bool,
+) -> list[dict[str, Any]]:
+    """Build per-row metadata aligned with ``DynamicContext.calculate_log_probs``.
+
+    ``calculate_log_probs`` indexes selected logprobs in request order for decode
+    steps (``only_last_token_logits``) or packed row order for mixed prefill/decode.
+    The older ``active_generated_token_metadata()`` ordering does not match that
+    indexing, which mislabels probe rows even when tensor/value counts agree.
+    """
+    iteration = int(collection_id) if str(collection_id).isdigit() else 0
+    active_slice = slice(context.paused_request_count, context.total_request_count)
+    request_ids = context.request_ids[active_slice].detach().cpu().tolist()
+
+    if only_last_token_logits or context.is_decode_only():
+        query_lengths = context.request_query_lengths[active_slice].detach().cpu().tolist()
+        cumulative = 0
+        last_row_indices: list[int] = []
+        for query_length in query_lengths:
+            cumulative += int(query_length)
+            last_row_indices.append(cumulative - 1)
+
+        metadata: list[dict[str, Any]] = []
+        for local_idx, request_id in enumerate(request_ids):
+            row_index = last_row_indices[local_idx]
+            input_token_index = int(
+                context.token_to_position_in_request[row_index].detach().cpu().item()
+            )
+            target_token_id = int(new_tokens[local_idx].detach().cpu().item())
+            metadata.append(
+                _inference_token_meta(
+                    iteration=iteration,
+                    collection_id=collection_id,
+                    rank=rank,
+                    request_id=int(request_id),
+                    row_index=row_index,
+                    input_token_index=input_token_index,
+                    target_token_id=target_token_id,
+                    is_generated_target=True,
+                    is_padding=False,
+                )
+            )
+        return metadata
+
+    active_token_count = int(context.active_token_count)
+    token_to_input_ids = context.token_to_input_ids[:active_token_count].clone()
+    token_to_position = context.token_to_position_in_request[:active_token_count]
+    token_to_request_idx = context.token_to_request_idx[:active_token_count]
+    request_query_lengths = context.request_query_lengths[active_slice].detach().cpu().tolist()
+    request_in_prefill = (
+        context.request_in_prefill_status_tensor[active_slice].detach().cpu().tolist()
+    )
+
+    active_token_ids = token_to_input_ids.roll(-1, 0)
+    new_token_idx = context.request_query_lengths[active_slice].cumsum(0) - 1
+    active_token_ids[new_token_idx] = new_tokens.to(active_token_ids.device)
+
+    metadata = []
+    rows_seen_by_request: dict[int, int] = {}
+    for row_index in range(active_token_count):
+        request_idx = int(token_to_request_idx[row_index].detach().cpu().item())
+        local_request_offset = request_idx - context.paused_request_count
+        request_id = int(request_ids[local_request_offset])
+        input_token_index = int(token_to_position[row_index].detach().cpu().item())
+        target_token_id = int(active_token_ids[row_index].detach().cpu().item())
+        row_offset = rows_seen_by_request.get(request_id, 0)
+        rows_seen_by_request[request_id] = row_offset + 1
+        is_prefill = bool(request_in_prefill[local_request_offset])
+        is_generated_target = (not is_prefill) or (
+            row_offset == int(request_query_lengths[local_request_offset]) - 1
+        )
+        metadata.append(
+            _inference_token_meta(
+                iteration=iteration,
+                collection_id=collection_id,
+                rank=rank,
+                request_id=request_id,
+                row_index=row_index,
+                input_token_index=input_token_index,
+                target_token_id=target_token_id,
+                is_generated_target=is_generated_target,
+                is_padding=not is_generated_target,
+            )
+        )
+    return metadata
 
 
 def build_inference_token_metadata(
@@ -404,18 +548,17 @@ def build_inference_token_metadata(
             row_offset == int(request_query_lengths[local_request_offset]) - 1
         )
         metadata.append(
-            {
-                "phase": "inference",
-                "row_index": row_index,
-                "request_id": request_id,
-                "routing_dump_id": f"{collection_id}_{rank:04d}_{request_id:08d}",
-                "input_token_index": input_token_index,
-                "target_token_index": input_token_index + 1,
-                "input_token_id": int(token_to_input_ids[row_index].detach().cpu().item()),
-                "prefix_hash": _inference_prefix_hash(request_id, input_token_index + 1),
-                "is_generated_target": is_generated_target,
-                "is_padding": not is_generated_target,
-            }
+            _inference_token_meta(
+                iteration=int(collection_id) if str(collection_id).isdigit() else 0,
+                collection_id=collection_id,
+                rank=rank,
+                request_id=request_id,
+                row_index=row_index,
+                input_token_index=input_token_index,
+                input_token_id=int(token_to_input_ids[row_index].detach().cpu().item()),
+                is_generated_target=is_generated_target,
+                is_padding=not is_generated_target,
+            )
         )
     for row_index in range(len(metadata), padded_token_count):
         metadata.append(
@@ -449,27 +592,65 @@ def build_training_token_metadata(
         seq_indices_list = [int(x) for x in seq_indices]
 
     token_ids = tokens.detach().cpu()
+    token_ids_list = token_ids.tolist()
     masks = generation_masks.detach().cpu() if generation_masks is not None else None
+
+    # Precompute, per batch row, the generation mask aligned to its seq_index and
+    # the cumulative count of generated tokens (so gen_offset is O(1) per token
+    # instead of an O(seq) nonzero scan).
+    mask_rows: list[list[int] | None] = []
+    cumsum_rows: list[list[int] | None] = []
+    for seq_index in seq_indices_list:
+        if masks is not None and 0 <= seq_index < masks.shape[0]:
+            m = masks[seq_index].to(torch.long)
+            mask_rows.append(m.tolist())
+            cumsum_rows.append(torch.cumsum(m, dim=0).tolist())
+        else:
+            mask_rows.append(None)
+            cumsum_rows.append(None)
+
+    turn_records = [
+        {
+            k: _json_default(v)
+            for k, v in (
+                turn_metadata[seq_index]
+                if turn_metadata is not None and 0 <= seq_index < len(turn_metadata)
+                else {}
+            ).items()
+            if k != "inference_top_logprobs"
+        }
+        for seq_index in seq_indices_list
+    ]
+
+    # Incremental prefix hash per batch row: rolling blake2b updated one token at a
+    # time, snapshotted (copy + hexdigest) only at generated target positions. This
+    # makes the whole pass O(seq * batch) instead of O(seq**2 * batch).
+    running = [hashlib.blake2b(digest_size=16) for _ in seq_indices_list]
+
     metadata = []
     # Megatron transformer internals are sequence-major for most activation tensors.
     for token_index in range(seq_length):
         for batch_row, seq_index in enumerate(seq_indices_list):
-            turn_record = (
-                turn_metadata[seq_index]
-                if turn_metadata is not None and 0 <= seq_index < len(turn_metadata)
-                else {}
+            row_tokens = token_ids_list[batch_row]
+            # Advance the rolling hash with the input token at this position; the
+            # digest now covers tokens[:token_index + 1] == prefix of the target.
+            running[batch_row].update(
+                int(row_tokens[token_index]).to_bytes(8, byteorder="little", signed=True)
             )
+
             target_token_index = token_index + 1
             is_generated_target = False
             gen_offset = None
             target_token_id = None
+            prefix_hash = None
             if target_token_index < seq_length:
-                target_token_id = int(token_ids[batch_row, target_token_index].item())
-                if masks is not None and seq_index < masks.shape[0]:
-                    is_generated_target = bool(masks[seq_index, target_token_index].item())
+                target_token_id = int(row_tokens[target_token_index])
+                mrow = mask_rows[batch_row]
+                if mrow is not None:
+                    is_generated_target = bool(mrow[target_token_index])
                     if is_generated_target:
-                        generated_positions = torch.nonzero(masks[seq_index], as_tuple=False).flatten()
-                        gen_offset = int((generated_positions == target_token_index).nonzero()[0].item())
+                        gen_offset = int(cumsum_rows[batch_row][target_token_index]) - 1
+                        prefix_hash = running[batch_row].copy().hexdigest()
 
             row = {
                 "phase": phase,
@@ -479,13 +660,13 @@ def build_training_token_metadata(
                 "seq_index": int(seq_index),
                 "input_token_index": int(token_index),
                 "target_token_index": int(target_token_index),
-                "input_token_id": int(token_ids[batch_row, token_index].item()),
+                "input_token_id": int(row_tokens[token_index]),
                 "target_token_id": target_token_id,
-                "prefix_hash": hash_token_ids(token_ids[batch_row, :target_token_index].tolist()),
+                "prefix_hash": prefix_hash,
                 "is_generated_target": is_generated_target,
                 "gen_offset": gen_offset,
             }
-            row.update({k: _json_default(v) for k, v in turn_record.items() if k != "inference_top_logprobs"})
+            row.update(turn_records[batch_row])
             metadata.append(row)
     return metadata
 
@@ -585,6 +766,38 @@ def update_inference_request_generated_tokens(
     if entry is None:
         return
     entry["generated_tokens"] = [int(x) for x in generated_tokens]
+
+
+def _inference_token_meta(
+    *,
+    iteration: int,
+    collection_id: str,
+    rank: int,
+    request_id: int,
+    row_index: int,
+    input_token_index: int,
+    is_generated_target: bool,
+    is_padding: bool,
+    input_token_id: int | None = None,
+    target_token_id: int | None = None,
+) -> dict[str, Any]:
+    meta: dict[str, Any] = {
+        "phase": "inference",
+        "iteration": iteration,
+        "row_index": row_index,
+        "request_id": request_id,
+        "routing_dump_id": f"{collection_id}_{rank:04d}_{request_id:08d}",
+        "input_token_index": input_token_index,
+        "target_token_index": input_token_index + 1,
+        "prefix_hash": _inference_prefix_hash(request_id, input_token_index + 1),
+        "is_generated_target": is_generated_target,
+        "is_padding": is_padding,
+    }
+    if input_token_id is not None:
+        meta["input_token_id"] = input_token_id
+    if target_token_id is not None:
+        meta["target_token_id"] = target_token_id
+    return meta
 
 
 def _inference_prefix_hash(request_id: int, target_token_index: int) -> str | None:

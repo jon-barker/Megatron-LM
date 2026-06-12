@@ -1083,7 +1083,7 @@ class TestDynamicContext:
         vocab_size = 50000
         # logits will have shape [1, total_active_tokens, vocab_size]
         prefill_logits = torch.randn(
-            1, total_active_tokens, vocab_size, device='cuda', dtype=torch.float32
+            1, total_active_tokens, vocab_size, device='cuda', dtype=torch.bfloat16
         )
 
         # New tokens from prefill (one token per active request)
@@ -1099,8 +1099,7 @@ class TestDynamicContext:
 
         # Calculate expected prefill log probs for the selected tokens
         expected_prefill_log_probs = (
-            torch.nn.functional.log_softmax(prefill_logits.squeeze(0), dim=-1)
-            .to(torch.float32)
+            torch.nn.functional.log_softmax(prefill_logits.squeeze(0).float(), dim=-1)
             .cpu()
         )
 
@@ -1130,15 +1129,15 @@ class TestDynamicContext:
 
         # Generate new logits for the decode step. Now each request contributes 1 token.
         decode_logits = torch.randn(
-            1, num_active_requests, vocab_size, device='cuda', dtype=torch.float32
+            1, num_active_requests, vocab_size, device='cuda', dtype=torch.bfloat16
         )
         decode_new_tokens = torch.randint(0, 100, (num_active_requests,), device='cuda').long()
         decode_log_probs, _ = dynamic_context.calculate_log_probs(decode_logits, decode_new_tokens)
 
         # Verify the stored decode log probabilities
         expected_decode_log_probs = torch.nn.functional.log_softmax(
-            decode_logits.squeeze(0), dim=-1
-        ).to(torch.float32)
+            decode_logits.squeeze(0).float(), dim=-1
+        )
 
         for i, (req_id, data) in enumerate(request_data.items()):
             assert len(decode_log_probs[i]) == 1, len(decode_log_probs[i])
@@ -1178,7 +1177,7 @@ class TestDynamicContext:
 
         total_active_tokens_mixed_step = dynamic_context.active_token_count
         mixed_step_logits = torch.randn(
-            1, total_active_tokens_mixed_step, vocab_size, device='cuda', dtype=torch.float32
+            1, total_active_tokens_mixed_step, vocab_size, device='cuda', dtype=torch.bfloat16
         )
 
         num_active_requests_mixed_step = (
@@ -1193,8 +1192,7 @@ class TestDynamicContext:
         )
 
         expected_mixed_step_log_probs = (
-            torch.nn.functional.log_softmax(mixed_step_logits.squeeze(0), dim=-1)
-            .to(torch.float32)
+            torch.nn.functional.log_softmax(mixed_step_logits.squeeze(0).float(), dim=-1)
             .cpu()
         )
 
