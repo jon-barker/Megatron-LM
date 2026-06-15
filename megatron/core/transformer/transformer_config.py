@@ -941,6 +941,9 @@ class TransformerConfig(ModelParallelConfig):
     is_hybrid_model: bool = False
     """ Indicates whether this is a hybrid model. """
 
+    rl_fp32_output_layer_logsoftmax: bool = False
+    """Run RL output-head matmul and log-softmax math in fp32 for train/inference alignment."""
+
     mamba_state_dim: int = 128
     """The dimensionality of the state representation in Mamba layers."""
 
